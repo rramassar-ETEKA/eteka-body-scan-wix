@@ -322,11 +322,14 @@ class BodyScanner:
 
     def _measurements_from_mesh(self, mesh, kp, height_cm):
         """
-        Compute body measurements via mesh slicing at anatomical Y levels from keypoints.
-        Since PIFuHD preserves the actual pose, at each slice we pick the polygon closest
-        to the body center (filters out arm polygons when they don't connect with torso).
+        Compute measurements via mesh slicing with POSE-AWARE polygon selection:
+        - TORSO: crop slice polygon to X range [-shoulder_half_width*1.3, same]
+          so arms are EXCLUDED even when connected to torso
+        - BICEPS / THIGH / KNEE / CALF: pick polygon closest to the
+          MediaPipe keypoint X for that limb
         """
         import trimesh, numpy as np
+        from shapely.geometry import box as shapely_box
 
         slices_3d = {}
         measurements = {}
@@ -354,75 +357,128 @@ class BodyScanner:
         ankle_y = (la[1] + ra[1]) / 2 if (la and ra) else knee_y + 0.4
         elbow_y = (le[1] + re[1]) / 2 if (le and re) else shoulder_y + 0.3
 
+        # Body half-widths from keypoints for X-based polygon selection
+        shoulder_halfw = abs(ls[0] - rs[0]) / 2
+        hip_halfw = abs(lh[0] - rh[0]) / 2
+
         def slice_at(y):
             try: return mesh.section(plane_origin=[0, y, 0], plane_normal=[0, 1, 0])
             except: return None
 
-        def circumf(y, name, selector="center"):
-            """
-            selector: "center" = polygon closest to 0,0 (torso)
-                      "off_center" = polygon farthest from 0,0 (leg/arm)
-            """
+        def get_polygons(y):
+            s = slice_at(y)
+            if s is None: return None, None
             try:
-                s = slice_at(y)
-                if s is None: return None
                 slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
-                    return None
-                polys = list(slice_2d.polygons_full)
+            except:
+                return None, None
+            if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
+                return None, None
+            return list(slice_2d.polygons_full), to_3d
 
-                if selector == "center":
-                    best = min(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
-                    factor = 1.0
-                elif selector == "off_center":
-                    if len(polys) == 1:
-                        best = polys[0]; factor = 0.5
-                    else:
-                        best = max(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
-                        factor = 1.0
+        def poly_to_3d(poly, to_3d, name, y):
+            coords_2d = np.array(poly.exterior.coords)
+            ones = np.ones(len(coords_2d))
+            coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
+            coords_3d = (to_3d @ coords_h.T).T[:, :3]
+            slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
+            return coords_3d
+
+        def torso_circumf(y, name, half_width):
+            """Crop polygon to central X band so arms are excluded."""
+            polys, to_3d = get_polygons(y)
+            if not polys: return None
+            # Pick polygon closest to center
+            central = min(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
+            # Crop to torso X range (1.4x shoulder/hip half-width for safety)
+            clip = shapely_box(-half_width * 1.4, -10.0, half_width * 1.4, 10.0)
+            try:
+                cropped = central.intersection(clip)
+                if hasattr(cropped, 'geoms'):
+                    cropped = max(cropped.geoms, key=lambda p: p.area)
+                if cropped.is_empty or cropped.area < 1e-4:
+                    cropped = central  # fallback if crop removes everything
+            except Exception:
+                cropped = central
+            poly_to_3d(cropped, to_3d, name, y)
+            return cropped.exterior.length * 100.0
+
+        def limb_circumf(y, name, target_x):
+            """Pick polygon closest to target_x (limb position from keypoints)."""
+            polys, to_3d = get_polygons(y)
+            if not polys: return None
+            # Pick polygon closest to target_x
+            best = min(polys, key=lambda p: (p.centroid.x - target_x) ** 2)
+            # Safety: if polygon is too wide (>25cm), it's not a limb - skip
+            bounds = best.bounds  # minx, miny, maxx, maxy
+            width_m = bounds[2] - bounds[0]
+            if width_m > 0.25:
+                # Polygon is body+limb merged. Try to crop to limb side.
+                if target_x > 0:
+                    clip = shapely_box(0.02, -10.0, 10.0, 10.0)
                 else:
-                    best = polys[0]; factor = 1.0
+                    clip = shapely_box(-10.0, -10.0, -0.02, 10.0)
+                try:
+                    cropped = best.intersection(clip)
+                    if hasattr(cropped, 'geoms'):
+                        cropped = max(cropped.geoms, key=lambda p: p.area)
+                    if not cropped.is_empty and cropped.area > 1e-4:
+                        best = cropped
+                except Exception:
+                    pass
+            poly_to_3d(best, to_3d, name, y)
+            return best.exterior.length * 100.0
 
-                coords_2d = np.array(best.exterior.coords)
-                ones = np.ones(len(coords_2d))
-                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
-                coords_3d = (to_3d @ coords_h.T).T[:, :3]
-                slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
-                return best.exterior.length * 100.0 * factor
-            except Exception as e:
-                print(f"Slice {name} error: {e}")
-                return None
-
-        # Torso
-        for name, frac in [("chest", 0.20), ("underbust", 0.35), ("waist", 0.55), ("hips", 1.0)]:
+        # ----- TORSO measurements (cropped to central X band) -----
+        for name, frac in [("chest", 0.20), ("underbust", 0.35), ("waist", 0.55)]:
             y = shoulder_y + (hip_y - shoulder_y) * frac
-            c = circumf(y, name, "center")
+            # Interpolate half-width between shoulder and hip
+            half_w = shoulder_halfw + (hip_halfw - shoulder_halfw) * frac
+            c = torso_circumf(y, name, half_w)
             if c: measurements[name] = round(c, 1)
 
-        # Legs (off-center polygon = single leg)
-        for name, frac in [("thigh", 0.35), ("knee", 1.0)]:
-            y = hip_y + (knee_y - hip_y) * frac
-            c = circumf(y, name, "off_center")
-            if c: measurements[name] = round(c, 1)
+        c = torso_circumf(hip_y, "hips", hip_halfw)
+        if c: measurements["hips"] = round(c, 1)
 
-        c = circumf(knee_y + (ankle_y - knee_y) * 0.30, "calf", "off_center")
-        if c: measurements["calf"] = round(c, 1)
+        # ----- LEG measurements (single leg via MediaPipe knee X) -----
+        if lk and rk:
+            # Mid-thigh: between hip and knee
+            y_thigh = hip_y + (knee_y - hip_y) * 0.35
+            # Target X: halfway between hip and knee (average of left + right leg positions)
+            leg_x = (lk[0] + rk[0]) / 2  # zero for most people
+            # Actually we want ONE leg, not center. Use one side.
+            # Use left knee X as target (arbitrary - body symmetric)
+            target_x_leg = lk[0]
+            c = limb_circumf(y_thigh, "thigh", target_x_leg)
+            if c: measurements["thigh"] = round(c, 1)
 
-        # Biceps
-        c = circumf(shoulder_y + (elbow_y - shoulder_y) * 0.40, "biceps", "off_center")
-        if c: measurements["biceps"] = round(c, 1)
+            c = limb_circumf(knee_y, "knee", target_x_leg)
+            if c: measurements["knee"] = round(c, 1)
 
-        # Shoulder width
+            y_calf = knee_y + (ankle_y - knee_y) * 0.30
+            calf_target = la[0] if la else target_x_leg
+            c = limb_circumf(y_calf, "calf", calf_target)
+            if c: measurements["calf"] = round(c, 1)
+
+        # ----- BICEPS (single arm via MediaPipe elbow X) -----
+        if le and re:
+            y_bic = shoulder_y + (elbow_y - shoulder_y) * 0.40
+            # Interpolate X between shoulder and elbow for the left arm
+            target_x_arm = ls[0] + (le[0] - ls[0]) * 0.40
+            c = limb_circumf(y_bic, "biceps", target_x_arm)
+            if c: measurements["biceps"] = round(c, 1)
+
+        # ----- Shoulder width (mesh X extent at shoulder) -----
         try:
             s = slice_at(shoulder_y + (hip_y - shoulder_y) * 0.05)
             if s is not None:
-                v = np.array(s.vertices)
-                measurements["shoulder_width"] = round((v[:, 0].max() - v[:, 0].min()) * 100.0, 1)
+                v_s = np.array(s.vertices)
+                measurements["shoulder_width"] = round((v_s[:, 0].max() - v_s[:, 0].min()) * 100.0, 1)
         except: pass
         if "shoulder_width" not in measurements:
             measurements["shoulder_width"] = round(dist_kp('left_shoulder', 'right_shoulder') * 100.0, 1)
 
-        # Lengths
+        # ----- Lengths from keypoints -----
         la_l = dist_kp('left_shoulder', 'left_elbow') + dist_kp('left_elbow', 'left_wrist')
         ra_l = dist_kp('right_shoulder', 'right_elbow') + dist_kp('right_elbow', 'right_wrist')
         if la_l + ra_l > 0:

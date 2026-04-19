@@ -17,31 +17,27 @@ Le parametre `?embed=1` :
 
 1. Dans l'editeur Wix, cliquez sur **+ Ajouter** > **Embed Code** > **Embed HTML** (ou **Code HTML personnalise**)
 2. Selectionnez **HTTP Embed** ou **Code**
-3. Collez le code suivant :
+3. Collez UNIQUEMENT le code iframe (les scripts sont bloques par Wix):
 
 ```html
 <iframe
-  id="eteka-bodyscan-iframe"
   src="https://eteka-body-scan-wix.vercel.app?embed=1"
   width="100%"
-  height="900"
+  height="1400"
   frameborder="0"
   allow="camera; microphone; fullscreen"
-  style="border: none; display: block; background: transparent;"
+  style="border: none; display: block;"
 ></iframe>
-
-<script>
-  // Auto-resize iframe based on content height
-  window.addEventListener("message", function (event) {
-    if (event.data && event.data.type === "eteka-bodyscan-resize") {
-      var iframe = document.getElementById("eteka-bodyscan-iframe");
-      if (iframe && event.data.height) {
-        iframe.style.height = (event.data.height + 20) + "px";
-      }
-    }
-  });
-</script>
 ```
+
+4. **IMPORTANT** : dans l'editeur Wix, redimensionnez l'element HTML Embed lui-meme
+   a environ **1400 pixels de hauteur** (glissez la poignee du bas). Sinon l'iframe
+   apparaitra coupe/petit meme avec `height="1400"` dans le code.
+
+### Script d'auto-resize (Wix Velo uniquement)
+
+Si Wix bloque le `<script>` (cas frequent sur free plan), ignorez-le et utilisez
+une hauteur fixe. Pour l'auto-resize, il faut activer **Dev Mode (Velo)** :
 
 ## Methode 2 : Velo (Dev Mode)
 

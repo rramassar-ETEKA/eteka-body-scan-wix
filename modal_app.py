@@ -168,17 +168,28 @@ class BodyScanner:
                 widths[i] = (cols.max() - cols.min()) / w
         return widths
 
-    def _refine_with_silhouettes(self, vertices, silhouettes):
+    def _refine_with_silhouettes(self, vertices, silhouettes, keypoints_3d):
         """
-        Vectorized mesh refinement using silhouette widths from 4 views.
-        Much faster than per-vertex loop.
+        Vectorized mesh refinement using silhouette widths.
+        Only applies to TORSO region (between shoulders and hips) where the body
+        is a single mass. Limbs (legs/arms) are left untouched to avoid artifacts
+        (legs are separate, uniform scaling would deform them).
         """
         import numpy as np
 
         v = np.array(vertices).copy()
         N_LEVELS = 50
 
-        # Compute width profiles for all views (single pass per view)
+        # Determine torso Y range using keypoints
+        shoulder_y = (keypoints_3d[KEYPOINTS['left_shoulder']][1] +
+                      keypoints_3d[KEYPOINTS['right_shoulder']][1]) / 2
+        hip_y = (keypoints_3d[KEYPOINTS['left_hip']][1] +
+                 keypoints_3d[KEYPOINTS['right_hip']][1]) / 2
+
+        torso_y_min = min(shoulder_y, hip_y)
+        torso_y_max = max(shoulder_y, hip_y)
+
+        # Compute width profiles for all views (normalized to silhouette bbox)
         profiles = {}
         for view, sil in silhouettes.items():
             profiles[view] = self._compute_silhouette_width_profile(sil, N_LEVELS)
@@ -205,46 +216,43 @@ class BodyScanner:
         if z_count > 0:
             z_profile /= z_count
 
-        # Compute mesh Y-level for each vertex (0=top/head, 1=bottom/feet)
         y_min = v[:, 1].min()
         y_max = v[:, 1].max()
         mesh_height = y_max - y_min
         if mesh_height < 1e-6:
             return v
 
-        # Normalize Y (images are top-down, but mesh Y axis direction depends)
-        # For SAM3D MHR, Y increases downward in world (based on observation)
-        # We'll determine orientation: head has max Y or min Y?
-        # Using keypoints would help but we keep it simple: top of mesh = y_min
-        # (based on existing pipeline where head is at y_min)
         y_norm = (v[:, 1] - y_min) / mesh_height  # 0 at top, 1 at bottom
 
-        # Get mesh X/Z center and current widths per level
-        x_center = (v[:, 0].max() + v[:, 0].min()) / 2
-        z_center = (v[:, 2].max() + v[:, 2].min()) / 2
+        # Only process vertices inside the torso Y range
+        torso_mask = (v[:, 1] >= torso_y_min) & (v[:, 1] <= torso_y_max)
 
-        # For each level, compute mesh current width (vectorized)
+        x_center = (v[torso_mask, 0].max() + v[torso_mask, 0].min()) / 2 if torso_mask.sum() > 0 else 0
+        z_center = (v[torso_mask, 2].max() + v[torso_mask, 2].min()) / 2 if torso_mask.sum() > 0 else 0
+
         level_edges = np.linspace(0, 1, N_LEVELS + 1)
         scale_x_per_vertex = np.ones(len(v))
         scale_z_per_vertex = np.ones(len(v))
 
         for lvl in range(N_LEVELS):
-            mask = (y_norm >= level_edges[lvl]) & (y_norm < level_edges[lvl + 1])
+            # Only refine within torso
+            mask = (
+                (y_norm >= level_edges[lvl]) &
+                (y_norm < level_edges[lvl + 1]) &
+                torso_mask
+            )
             if mask.sum() < 5:
                 continue
 
             current_x_range = v[mask, 0].max() - v[mask, 0].min()
             current_z_range = v[mask, 2].max() - v[mask, 2].min()
 
-            # Target widths (silhouette width fraction * mesh_height scale factor)
-            # silhouette gives width as fraction of image width.
-            # We use mesh_height * 0.5 as anatomical reference (body fits ~0.4-0.5 of image height)
             ref = mesh_height * 0.5
 
             if x_count > 0 and x_profile[lvl] > 0.01 and current_x_range > 1e-4:
                 target_x = x_profile[lvl] * ref
                 s = target_x / current_x_range
-                s = np.clip(s, 0.9, 1.1)  # tighter clamp for stability
+                s = np.clip(s, 0.9, 1.1)
                 scale_x_per_vertex[mask] = s
 
             if z_count > 0 and z_profile[lvl] > 0.01 and current_z_range > 1e-4:
@@ -276,11 +284,13 @@ class BodyScanner:
             except Exception as e:
                 print(f"Silhouette extraction failed for {view_name}: {e}")
 
-        # 3. Refine mesh if we have enough silhouettes
+        # 3. Refine mesh TORSO if we have enough silhouettes
         vertices = np.array(base["vertices"])
         if len(silhouettes) >= 2:
             try:
-                vertices = self._refine_with_silhouettes(vertices, silhouettes)
+                vertices = self._refine_with_silhouettes(
+                    vertices, silhouettes, base["keypoints_3d"]
+                )
             except Exception as e:
                 print(f"Refinement failed: {e}")
 

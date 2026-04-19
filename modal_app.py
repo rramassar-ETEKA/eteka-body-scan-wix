@@ -42,7 +42,7 @@ image = (
         "onnxruntime",
         "tqdm",
         "matplotlib",
-        "mediapipe",
+        "mediapipe==0.10.14",
     )
     .run_commands(
         "git clone https://github.com/facebookresearch/pifuhd.git /opt/pifuhd",

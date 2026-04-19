@@ -45,30 +45,70 @@ export default function Home() {
     setStatus("form");
   };
 
+  const compressImage = async (file: File, maxDim = 1280, quality = 0.85): Promise<File> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext("2d")!;
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) return reject(new Error("Compression failed"));
+            resolve(new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"), { type: "image/jpeg" }));
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = reject;
+      img.src = URL.createObjectURL(file);
+    });
+  };
+
   const handleAnalyze = async () => {
     setStatus("analyzing");
     setError("");
 
+    const MODAL_URL = process.env.NEXT_PUBLIC_MODAL_API_URL;
+    if (!MODAL_URL) {
+      setError("Configuration manquante: NEXT_PUBLIC_MODAL_API_URL");
+      setStatus("error");
+      return;
+    }
+
     try {
       const formData = new FormData();
-      formData.append("mode", mode);
       formData.append("height_cm", height.toString());
-      formData.append("weight_kg", weight.toString());
-      formData.append("gender", gender);
+
+      let endpoint = "";
 
       if (mode === "standard" && photos) {
-        formData.append("photo_front", photos.front.file);
-        formData.append("photo_left", photos.left.file);
-        formData.append("photo_back", photos.back.file);
-        formData.append("photo_right", photos.right.file);
+        endpoint = `${MODAL_URL}/analyze_multiview`;
+        const compressed = {
+          front: await compressImage(photos.front.file),
+          left: await compressImage(photos.left.file),
+          back: await compressImage(photos.back.file),
+          right: await compressImage(photos.right.file),
+        };
+        formData.append("photo_front", compressed.front);
+        formData.append("photo_left", compressed.left);
+        formData.append("photo_back", compressed.back);
+        formData.append("photo_right", compressed.right);
       } else if (mode === "premium" && video) {
+        endpoint = `${MODAL_URL}/analyze_video`;
         formData.append("video", video.file);
+      } else {
+        throw new Error("Donnees manquantes");
       }
 
-      const res = await fetch("/api/analyze", { method: "POST", body: formData });
+      const res = await fetch(endpoint, { method: "POST", body: formData });
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Erreur lors de l'analyse");
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Erreur ${res.status}`);
       }
 
       const data = await res.json();

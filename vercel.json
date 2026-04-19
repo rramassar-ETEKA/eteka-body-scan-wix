@@ -1,0 +1,10 @@
+{
+  "framework": "nextjs",
+  "regions": ["cdg1"],
+  "functions": {
+    "src/app/api/analyze/route.ts": {
+      "maxDuration": 300,
+      "memory": 1024
+    }
+  }
+}

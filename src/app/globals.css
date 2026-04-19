@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0f0f13;
+  --foreground: #e8e8ed;
+  --primary: #6c5ce7;
+  --primary-light: #a29bfe;
+  --accent: #00cec9;
+  --surface: #1a1a24;
+  --surface-light: #252535;
+  --border: #2d2d3f;
+  --success: #00b894;
+  --warning: #fdcb6e;
+  --error: #ff6b6b;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: system-ui, -apple-system, sans-serif;
+  margin: 0;
+}
+
+@layer utilities {
+  .glass {
+    background: rgba(26, 26, 36, 0.8);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--border);
+  }
+}
+
+.scan-line {
+  animation: scan 2s ease-in-out infinite;
+}
+
+@keyframes scan {
+  0% {
+    top: 0%;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    top: 100%;
+    opacity: 0;
+  }
+}
+
+.pose-silhouette {
+  opacity: 0.3;
+  pointer-events: none;
+  animation: pulse 3s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}

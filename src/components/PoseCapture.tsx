@@ -265,7 +265,6 @@ export default function PoseCapture({ onComplete }: PoseCaptureProps) {
             ref={fileInputRef}
             type="file"
             accept="image/*"
-            capture="environment"
             onChange={handleFileUpload}
             className="hidden"
           />

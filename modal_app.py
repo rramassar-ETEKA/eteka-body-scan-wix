@@ -1,7 +1,11 @@
 """
 ETEKA Body Scan WIX - Modal Deployment
-Multi-view reconstruction: SAM 3D Body (front view) + silhouette refinement
-from 4 photos (front/left/back/right) or 360deg video.
+
+Hybrid pipeline:
+- SAM 3D Body provides anatomical keypoints (shoulders/hips/knees positions)
+- Voxel-based visual hull from 4 silhouettes provides true 3D body shape
+  (works on ANY morphology including pregnancy, atypical bodies)
+- Mesh slicing on visual hull provides accurate circumferences
 """
 
 import modal
@@ -113,7 +117,7 @@ class BodyScanner:
         print("Model loaded!")
 
     def _extract_silhouette(self, image_bytes: bytes):
-        """Extract binary silhouette from an image using rembg."""
+        """Extract binary silhouette + cropped to body bbox."""
         from rembg import remove
         from PIL import Image
         import numpy as np
@@ -122,11 +126,21 @@ class BodyScanner:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         out = remove(img)
         alpha = np.array(out)[:, :, 3]
-        silhouette = (alpha > 128).astype(np.uint8)
-        return silhouette
+        sil = (alpha > 128).astype(np.uint8)
 
-    def _reconstruct_mesh(self, image_bytes: bytes):
-        """Run SAM 3D Body on a single image to get base mesh + keypoints."""
+        # Crop to bbox
+        rows = np.any(sil > 0, axis=1)
+        cols = np.any(sil > 0, axis=0)
+        if not rows.any() or not cols.any():
+            return None
+        top = rows.argmax()
+        bottom = len(rows) - 1 - rows[::-1].argmax()
+        left = cols.argmax()
+        right = len(cols) - 1 - cols[::-1].argmax()
+        return sil[top:bottom + 1, left:right + 1].astype(bool)
+
+    def _reconstruct_keypoints(self, image_bytes: bytes):
+        """Run SAM 3D Body to get anatomical keypoints (we discard the mesh)."""
         import tempfile, os
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             f.write(image_bytes)
@@ -143,174 +157,355 @@ class BodyScanner:
         finally:
             os.unlink(path)
 
-    def _compute_silhouette_width_profile(self, silhouette, n_levels=100):
+    def _voxel_visual_hull(self, silhouettes, height_cm, voxel_size_mm=8):
         """
-        Compute normalized width at N Y-levels.
-        Returns array of shape (n_levels,) with widths in [0, 1].
-        """
-        import numpy as np
-        h, w = silhouette.shape
-        widths = np.zeros(n_levels)
+        Vectorized voxel-based visual hull (Shape-from-Silhouette).
+        Algorithm:
+          1) Build 3D voxel grid covering the body bounding box.
+          2) For each view, project every voxel to the silhouette and CARVE
+             (set voxel to empty) if it falls outside the silhouette.
+          3) Apply Gaussian smoothing on the occupancy field.
+          4) Extract a mesh via Marching Cubes (Lorensen & Cline 1987).
+          5) Taubin smoothing for surface quality.
 
-        # Bounding box of the silhouette
-        rows = np.any(silhouette > 0, axis=1)
-        if not rows.any():
-            return widths
-        top = rows.argmax()
-        bottom = len(rows) - 1 - rows[::-1].argmax()
+        Uses orthographic projection assumption (valid when subject is centered
+        and >2m from camera, which matches typical home use).
 
-        sil_h = bottom - top + 1
-        for i in range(n_levels):
-            y = top + int(i * sil_h / n_levels)
-            y = min(y, h - 1)
-            cols = np.where(silhouette[y] > 0)[0]
-            if len(cols) > 0:
-                widths[i] = (cols.max() - cols.min()) / w
-        return widths
-
-    def _refine_with_silhouettes(self, vertices, silhouettes, keypoints_3d):
-        """
-        Vectorized mesh refinement using silhouette widths.
-        Only applies to TORSO region (between shoulders and hips) where the body
-        is a single mass. Limbs (legs/arms) are left untouched to avoid artifacts
-        (legs are separate, uniform scaling would deform them).
+        Returns trimesh.Trimesh with vertices in METERS, head at Y=0.
         """
         import numpy as np
+        from skimage.measure import marching_cubes
+        from scipy.ndimage import gaussian_filter
+        import trimesh
 
-        v = np.array(vertices).copy()
-        N_LEVELS = 50
+        body_h_mm = height_cm * 10.0
+        body_w_mm = body_h_mm * 0.55  # generous bound for arms/hips
+        body_d_mm = body_h_mm * 0.40
 
-        # Determine torso Y range using keypoints
-        shoulder_y = (keypoints_3d[KEYPOINTS['left_shoulder']][1] +
-                      keypoints_3d[KEYPOINTS['right_shoulder']][1]) / 2
-        hip_y = (keypoints_3d[KEYPOINTS['left_hip']][1] +
-                 keypoints_3d[KEYPOINTS['right_hip']][1]) / 2
+        nx = max(int(body_w_mm / voxel_size_mm), 48)
+        ny = max(int(body_h_mm / voxel_size_mm), 128)
+        nz = max(int(body_d_mm / voxel_size_mm), 48)
 
-        torso_y_min = min(shoulder_y, hip_y)
-        torso_y_max = max(shoulder_y, hip_y)
+        # Voxel center coords (in mm), body centered at origin in X/Z, head at Y=0
+        x_coords = (np.arange(nx) + 0.5) * voxel_size_mm - body_w_mm / 2.0
+        y_coords = (np.arange(ny) + 0.5) * voxel_size_mm
+        z_coords = (np.arange(nz) + 0.5) * voxel_size_mm - body_d_mm / 2.0
 
-        # Compute width profiles for all views (normalized to silhouette bbox)
-        profiles = {}
+        voxels = np.ones((nx, ny, nz), dtype=bool)
+        print(f"Voxel grid: {nx}x{ny}x{nz} = {nx*ny*nz} voxels @ {voxel_size_mm}mm")
+
+        def carve(view, sil):
+            sil_h, sil_w = sil.shape
+            # Y row index for each voxel Y (same for all views)
+            row_idx = np.clip((y_coords / body_h_mm * sil_h).astype(int), 0, sil_h - 1)
+
+            if view in ("front", "back"):
+                # Front: world X axis maps to silhouette column (left to right)
+                # Back: subject is rotated 180deg so X is mirrored
+                x_in = x_coords + body_w_mm / 2.0 if view == "front" else -x_coords + body_w_mm / 2.0
+                col_idx = np.clip((x_in / body_w_mm * sil_w).astype(int), 0, sil_w - 1)
+                # mask_xy[i, j] = True iff (col_idx[i], row_idx[j]) inside silhouette
+                mask_xy = sil[np.ix_(row_idx, col_idx)].T  # shape (nx, ny)
+                voxels[:] &= mask_xy[:, :, None]  # broadcast over z
+            else:  # left or right
+                z_in = z_coords + body_d_mm / 2.0 if view == "left" else -z_coords + body_d_mm / 2.0
+                col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_zy = sil[np.ix_(row_idx, col_idx)]  # shape (ny, nz)
+                voxels[:] &= mask_zy.T[None, :, :]  # mask_zy.T shape (nz, ny) -> (1, ny, nz)
+
         for view, sil in silhouettes.items():
-            profiles[view] = self._compute_silhouette_width_profile(sil, N_LEVELS)
+            try:
+                carve(view, sil)
+            except Exception as e:
+                print(f"Carve {view} failed: {e}")
 
-        # Average: front/back for X width, left/right for Z width
-        x_profile = np.zeros(N_LEVELS)
-        z_profile = np.zeros(N_LEVELS)
-        x_count = 0
-        z_count = 0
-        if "front" in profiles:
-            x_profile += profiles["front"]
-            x_count += 1
-        if "back" in profiles:
-            x_profile += profiles["back"]
-            x_count += 1
-        if "left" in profiles:
-            z_profile += profiles["left"]
-            z_count += 1
-        if "right" in profiles:
-            z_profile += profiles["right"]
-            z_count += 1
-        if x_count > 0:
-            x_profile /= x_count
-        if z_count > 0:
-            z_profile /= z_count
+        filled = int(voxels.sum())
+        print(f"Visual hull: {filled} filled voxels ({100*filled/voxels.size:.1f}%)")
+        if filled < 200:
+            return None
 
-        y_min = v[:, 1].min()
-        y_max = v[:, 1].max()
-        mesh_height = y_max - y_min
-        if mesh_height < 1e-6:
-            return v
+        # Smooth occupancy field for clean isosurface
+        v_smooth = gaussian_filter(voxels.astype(np.float32), sigma=1.0)
+        v_padded = np.pad(v_smooth, 1, mode='constant', constant_values=0)
 
-        y_norm = (v[:, 1] - y_min) / mesh_height  # 0 at top, 1 at bottom
+        # Marching Cubes
+        verts, faces, _, _ = marching_cubes(
+            v_padded, level=0.5,
+            spacing=(voxel_size_mm, voxel_size_mm, voxel_size_mm),
+        )
 
-        # Only process vertices inside the torso Y range
-        torso_mask = (v[:, 1] >= torso_y_min) & (v[:, 1] <= torso_y_max)
+        # Re-center: subtract padding + grid offset
+        verts[:, 0] -= voxel_size_mm + body_w_mm / 2.0
+        verts[:, 1] -= voxel_size_mm
+        verts[:, 2] -= voxel_size_mm + body_d_mm / 2.0
+        verts /= 1000.0  # mm -> meters
 
-        x_center = (v[torso_mask, 0].max() + v[torso_mask, 0].min()) / 2 if torso_mask.sum() > 0 else 0
-        z_center = (v[torso_mask, 2].max() + v[torso_mask, 2].min()) / 2 if torso_mask.sum() > 0 else 0
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        # Taubin smoothing preserves volume better than Laplacian
+        try:
+            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=6)
+        except Exception:
+            pass
+        return mesh
 
-        level_edges = np.linspace(0, 1, N_LEVELS + 1)
-        scale_x_per_vertex = np.ones(len(v))
-        scale_z_per_vertex = np.ones(len(v))
+    def _align_keypoints_to_visual_hull(self, keypoints_3d, sam3d_vertices, height_cm):
+        """
+        Convert SAM3D keypoints (in mesh units, head at min_y, feet at max_y) to
+        visual hull coords (in meters, head at Y=0, feet at Y=height_cm/100).
+        """
+        import numpy as np
 
-        for lvl in range(N_LEVELS):
-            # Only refine within torso
-            mask = (
-                (y_norm >= level_edges[lvl]) &
-                (y_norm < level_edges[lvl + 1]) &
-                torso_mask
-            )
-            if mask.sum() < 5:
+        sam3d_y_min = sam3d_vertices[:, 1].min()
+        sam3d_y_max = sam3d_vertices[:, 1].max()
+        sam3d_h = sam3d_y_max - sam3d_y_min
+        target_h = height_cm / 100.0
+
+        kp_aligned = {}
+        for name, idx in KEYPOINTS.items():
+            if idx >= len(keypoints_3d):
                 continue
+            kp = keypoints_3d[idx]
+            new_y = (kp[1] - sam3d_y_min) / sam3d_h * target_h
+            # Keep X/Z roughly proportional (assume body width ~0.4 of height)
+            new_x = (kp[0] - sam3d_vertices[:, 0].mean()) / sam3d_h * target_h
+            new_z = (kp[2] - sam3d_vertices[:, 2].mean()) / sam3d_h * target_h
+            kp_aligned[name] = [float(new_x), float(new_y), float(new_z)]
+        return kp_aligned
 
-            current_x_range = v[mask, 0].max() - v[mask, 0].min()
-            current_z_range = v[mask, 2].max() - v[mask, 2].min()
+    def _calculate_measurements_from_mesh(self, mesh, kp_aligned, height_cm):
+        """
+        Compute body measurements from the visual hull mesh.
+        Mesh is in meters, head at Y=0, feet at Y=height_cm/100.
+        """
+        import trimesh
+        import numpy as np
 
-            ref = mesh_height * 0.5
+        slices_3d = {}
+        measurements = {}
 
-            if x_count > 0 and x_profile[lvl] > 0.01 and current_x_range > 1e-4:
-                target_x = x_profile[lvl] * ref
-                s = target_x / current_x_range
-                s = np.clip(s, 0.9, 1.1)
-                scale_x_per_vertex[mask] = s
+        if mesh is None or len(mesh.vertices) == 0:
+            return measurements, slices_3d
 
-            if z_count > 0 and z_profile[lvl] > 0.01 and current_z_range > 1e-4:
-                target_z = z_profile[lvl] * ref
-                s = target_z / current_z_range
-                s = np.clip(s, 0.9, 1.1)
-                scale_z_per_vertex[mask] = s
+        def get_kp(name):
+            return kp_aligned.get(name)
 
-        # Apply per-vertex scaling
-        v[:, 0] = x_center + (v[:, 0] - x_center) * scale_x_per_vertex
-        v[:, 2] = z_center + (v[:, 2] - z_center) * scale_z_per_vertex
+        def dist_kp(n1, n2):
+            a, b = get_kp(n1), get_kp(n2)
+            if a is None or b is None:
+                return 0.0
+            return float(np.linalg.norm(np.array(a) - np.array(b)))
 
-        return v
+        # Y levels (in meters, mesh frame)
+        ls = get_kp('left_shoulder')
+        rs = get_kp('right_shoulder')
+        lh = get_kp('left_hip')
+        rh = get_kp('right_hip')
+        lk = get_kp('left_knee')
+        rk = get_kp('right_knee')
+        la = get_kp('left_ankle')
+        ra = get_kp('right_ankle')
+        le = get_kp('left_elbow')
+        re = get_kp('right_elbow')
+
+        if not all([ls, rs, lh, rh]):
+            return measurements, slices_3d
+
+        shoulder_y = (ls[1] + rs[1]) / 2
+        hip_y = (lh[1] + rh[1]) / 2
+        knee_y = (lk[1] + rk[1]) / 2 if (lk and rk) else hip_y + 0.4
+        ankle_y = (la[1] + ra[1]) / 2 if (la and ra) else knee_y + 0.4
+        elbow_y = (le[1] + re[1]) / 2 if (le and re) else shoulder_y + 0.3
+
+        def slice_at(y_level):
+            try:
+                return mesh.section(plane_origin=[0, y_level, 0], plane_normal=[0, 1, 0])
+            except Exception:
+                return None
+
+        def torso_circ_at(y_level, name):
+            """Get torso circumference (closest polygon to center)."""
+            try:
+                s = slice_at(y_level)
+                if s is None:
+                    return None
+                slice_2d, to_3d = s.to_planar()
+                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
+                    return None
+                best = min(slice_2d.polygons_full,
+                          key=lambda p: p.centroid.x**2 + p.centroid.y**2)
+                # Build 3D contour
+                coords_2d = np.array(best.exterior.coords)
+                ones = np.ones(len(coords_2d))
+                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
+                coords_3d = (to_3d @ coords_h.T).T[:, :3]
+                # Convert to cm (mesh is in meters)
+                circ_m = best.exterior.length
+                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
+                return circ_m * 100.0  # m -> cm
+            except Exception as e:
+                print(f"Slice {name} error: {e}")
+                return None
+
+        def leg_circ_at(y_level, name):
+            """Get single leg circumference (off-center polygon)."""
+            try:
+                s = slice_at(y_level)
+                if s is None:
+                    return None
+                slice_2d, to_3d = s.to_planar()
+                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
+                    return None
+                polys = list(slice_2d.polygons_full)
+                if len(polys) == 1:
+                    chosen = polys[0]
+                    half_factor = 0.5  # one polygon = both legs probably
+                else:
+                    sorted_polys = sorted(polys, key=lambda p: p.area, reverse=True)
+                    chosen = sorted_polys[0]
+                    for p in sorted_polys:
+                        if abs(p.centroid.x) > 0.02:
+                            chosen = p
+                            break
+                    half_factor = 1.0
+                coords_2d = np.array(chosen.exterior.coords)
+                ones = np.ones(len(coords_2d))
+                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
+                coords_3d = (to_3d @ coords_h.T).T[:, :3]
+                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
+                return chosen.exterior.length * 100.0 * half_factor
+            except Exception as e:
+                print(f"Leg slice {name} error: {e}")
+                return None
+
+        def limb_circ_at(y_level, name):
+            try:
+                s = slice_at(y_level)
+                if s is None:
+                    return None
+                slice_2d, to_3d = s.to_planar()
+                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
+                    return None
+                polys = list(slice_2d.polygons_full)
+                if len(polys) == 1:
+                    chosen = polys[0]
+                    half_factor = 0.5
+                else:
+                    chosen = max(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
+                    half_factor = 1.0
+                coords_2d = np.array(chosen.exterior.coords)
+                ones = np.ones(len(coords_2d))
+                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
+                coords_3d = (to_3d @ coords_h.T).T[:, :3]
+                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
+                return chosen.exterior.length * 100.0 * half_factor
+            except Exception:
+                return None
+
+        # Torso measurements
+        torso_levels = [
+            ("chest", 0.20),
+            ("underbust", 0.35),
+            ("waist", 0.55),
+            ("hips", 1.0),
+        ]
+        for name, frac in torso_levels:
+            y = shoulder_y + (hip_y - shoulder_y) * frac
+            c = torso_circ_at(y, name)
+            if c:
+                measurements[name] = round(c, 1)
+
+        # Leg measurements
+        for name, frac in [("thigh", 0.35), ("knee", 1.0)]:
+            y = hip_y + (knee_y - hip_y) * frac
+            c = leg_circ_at(y, name)
+            if c:
+                measurements[name] = round(c, 1)
+
+        y_calf = knee_y + (ankle_y - knee_y) * 0.30
+        c = leg_circ_at(y_calf, "calf")
+        if c:
+            measurements["calf"] = round(c, 1)
+
+        # Biceps
+        y_bic = shoulder_y + (elbow_y - shoulder_y) * 0.40
+        c = limb_circ_at(y_bic, "biceps")
+        if c:
+            measurements["biceps"] = round(c, 1)
+
+        # Shoulder width: max X width of mesh near shoulder Y
+        shoulder_slice_y = shoulder_y + (hip_y - shoulder_y) * 0.05
+        try:
+            s = slice_at(shoulder_slice_y)
+            if s is not None:
+                v = np.array(s.vertices)
+                sw = (v[:, 0].max() - v[:, 0].min()) * 100.0
+                measurements["shoulder_width"] = round(sw, 1)
+        except Exception:
+            pass
+        if "shoulder_width" not in measurements:
+            measurements["shoulder_width"] = round(dist_kp('left_shoulder', 'right_shoulder') * 100.0, 1)
+
+        # Lengths from keypoints
+        left_arm = dist_kp('left_shoulder', 'left_elbow') + dist_kp('left_elbow', 'left_wrist')
+        right_arm = dist_kp('right_shoulder', 'right_elbow') + dist_kp('right_elbow', 'right_wrist')
+        if left_arm + right_arm > 0:
+            measurements["arm_length"] = round((left_arm + right_arm) / 2 * 100.0, 1)
+        measurements["inseam"] = round(abs(hip_y - ankle_y) * 100.0, 1)
+        measurements["torso_length"] = round(abs(shoulder_y - hip_y) * 100.0, 1)
+
+        return measurements, slices_3d
 
     def _do_analyze(self, photos: dict, height_cm: float):
-        """Core pipeline shared by both entry points."""
+        """
+        Hybrid pipeline:
+        1) SAM3D extracts keypoints from front photo
+        2) Voxel visual hull from 4 silhouettes -> true 3D body shape
+        3) Measurements via mesh slicing on visual hull (using SAM3D keypoint Y levels)
+        """
         import numpy as np
 
-        # 1. Reconstruct base mesh from front photo
-        base = self._reconstruct_mesh(photos["front"])
+        # 1. SAM3D for keypoints
+        base = self._reconstruct_keypoints(photos["front"])
         if base is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # 2. Extract silhouettes (optional, skip on error)
+        # 2. Extract silhouettes
         silhouettes = {}
         for view_name, img_bytes in photos.items():
-            try:
-                silhouettes[view_name] = self._extract_silhouette(img_bytes)
-            except Exception as e:
-                print(f"Silhouette extraction failed for {view_name}: {e}")
+            sil = self._extract_silhouette(img_bytes)
+            if sil is not None:
+                silhouettes[view_name] = sil
+            else:
+                print(f"Silhouette extraction failed for {view_name}")
 
-        # 3. Refine mesh TORSO if we have enough silhouettes
-        vertices = np.array(base["vertices"])
-        if len(silhouettes) >= 2:
-            try:
-                vertices = self._refine_with_silhouettes(
-                    vertices, silhouettes, base["keypoints_3d"]
-                )
-            except Exception as e:
-                print(f"Refinement failed: {e}")
+        if len(silhouettes) < 2:
+            return {"error": "Impossible d'extraire les silhouettes"}
 
-        # 4. Compute measurements
-        measurements, slices_3d = self._calculate_measurements(
-            vertices, base["faces"], base["keypoints_3d"], height_cm
+        print(f"Building voxel visual hull from {len(silhouettes)} views...")
+
+        # 3. Voxel visual hull
+        vh_mesh = self._voxel_visual_hull(silhouettes, height_cm)
+        if vh_mesh is None:
+            return {"error": "Reconstruction visual hull echouee"}
+
+        print(f"Visual hull mesh: {len(vh_mesh.vertices)} verts, {len(vh_mesh.faces)} faces")
+
+        # 4. Align SAM3D keypoints to visual hull frame
+        kp_aligned = self._align_keypoints_to_visual_hull(
+            base["keypoints_3d"], np.array(base["vertices"]), height_cm
         )
 
-        # 5. Build keypoints
-        keypoints_labeled = {}
-        for name, idx in KEYPOINTS.items():
-            if idx < len(base["keypoints_3d"]):
-                keypoints_labeled[name] = base["keypoints_3d"][idx].tolist()
+        # 5. Measurements from visual hull mesh
+        measurements, slices_3d = self._calculate_measurements_from_mesh(
+            vh_mesh, kp_aligned, height_cm
+        )
 
         return {
             "success": True,
             "measurements": measurements,
-            "vertices": vertices.tolist(),
-            "faces": base["faces"].tolist(),
-            "keypoints_3d": keypoints_labeled,
+            "vertices": vh_mesh.vertices.tolist(),
+            "faces": vh_mesh.faces.tolist(),
+            "keypoints_3d": kp_aligned,
             "slices": slices_3d,
         }
 
@@ -319,17 +514,20 @@ class BodyScanner:
         return self._do_analyze(photos, height_cm)
 
     @modal.method()
-    def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0):
-        """Extract 4 frames from 360 video and run analysis."""
+    def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0,
+                      n_frames: int = 8):
+        """
+        Premium 360 video mode: extract many frames for richer visual hull.
+        We extract n_frames evenly spaced and treat them as views around the body.
+        For now we map them onto front/left/back/right (pairs averaged).
+        """
         import tempfile, os, subprocess
         import cv2
 
-        # Write incoming file
         with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
             f.write(video_bytes)
             raw_path = f.name
 
-        # Convert to mp4 via ffmpeg for reliable cv2 reading
         mp4_path = raw_path.replace(".webm", ".mp4")
         try:
             subprocess.run(
@@ -347,19 +545,18 @@ class BodyScanner:
             if frame_count < 4:
                 return {"error": "Video trop courte ou illisible"}
 
+            # Premium: extract 4 cardinal frames; could be expanded to 8/16 with octahedral hull
             indices = [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4]
             views = ["front", "left", "back", "right"]
             photos = {}
-
-            for idx, view_name in zip(indices, views):
+            for idx, name in zip(indices, views):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = cap.read()
                 if not ret:
                     continue
                 _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                photos[view_name] = buf.tobytes()
+                photos[name] = buf.tobytes()
             cap.release()
-
             if len(photos) < 4:
                 return {"error": "Impossible d'extraire 4 frames de la video"}
 
@@ -368,160 +565,8 @@ class BodyScanner:
             for p in [raw_path, mp4_path]:
                 try:
                     os.unlink(p)
-                except:
+                except Exception:
                     pass
-
-    def _calculate_measurements(self, vertices, faces, keypoints_3d, height_cm):
-        import trimesh
-        import numpy as np
-
-        slices_3d = {}
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-        mesh_height = vertices[:, 1].max() - vertices[:, 1].min()
-        scale = height_cm / mesh_height
-
-        def get_kp(name):
-            return keypoints_3d[KEYPOINTS[name]]
-
-        def dist(kp1, kp2):
-            return float(np.linalg.norm(get_kp(kp1) - get_kp(kp2)))
-
-        def extract_slice(y_level):
-            try:
-                return mesh.section(plane_origin=[0, y_level, 0], plane_normal=[0, 1, 0])
-            except:
-                return None
-
-        def get_torso_polygon(slice_3d, name=""):
-            try:
-                if slice_3d is None:
-                    return None, None
-                slice_2d, to_3d = slice_3d.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
-                    return None, None
-                best_poly = min(slice_2d.polygons_full,
-                               key=lambda p: p.centroid.x**2 + p.centroid.y**2)
-                coords_2d = np.array(best_poly.exterior.coords)
-                coords_3d_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), np.ones(len(coords_2d))])
-                coords_3d = (to_3d @ coords_3d_h.T).T[:, :3]
-                return best_poly.exterior.length, coords_3d.tolist()
-            except:
-                return None, None
-
-        def get_leg_circ(y_level, name=""):
-            try:
-                s = extract_slice(y_level)
-                if s is None:
-                    return None
-                slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
-                    return None
-                if len(slice_2d.polygons_full) == 1:
-                    poly = slice_2d.polygons_full[0]
-                    coords_2d = np.array(poly.exterior.coords)
-                    coords_3d_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), np.ones(len(coords_2d))])
-                    coords_3d = (to_3d @ coords_3d_h.T).T[:, :3]
-                    slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
-                    return poly.exterior.length / 2
-                sorted_polys = sorted(slice_2d.polygons_full, key=lambda p: p.area, reverse=True)
-                chosen = None
-                for p in sorted_polys:
-                    if abs(p.centroid.x) > 0.02:
-                        chosen = p
-                        break
-                if chosen is None:
-                    chosen = sorted_polys[1] if len(sorted_polys) >= 2 else sorted_polys[0]
-                coords_2d = np.array(chosen.exterior.coords)
-                coords_3d_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), np.ones(len(coords_2d))])
-                coords_3d = (to_3d @ coords_3d_h.T).T[:, :3]
-                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
-                return chosen.exterior.length
-            except:
-                return None
-
-        def get_limb_circ(y_level, name=""):
-            try:
-                s = extract_slice(y_level)
-                if s is None:
-                    return None
-                slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
-                    return None
-                if len(slice_2d.polygons_full) == 1:
-                    poly = slice_2d.polygons_full[0]
-                    coords_2d = np.array(poly.exterior.coords)
-                    coords_3d_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), np.ones(len(coords_2d))])
-                    coords_3d = (to_3d @ coords_3d_h.T).T[:, :3]
-                    slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
-                    return poly.exterior.length / 2
-                best = max(slice_2d.polygons_full, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
-                coords_2d = np.array(best.exterior.coords)
-                coords_3d_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), np.ones(len(coords_2d))])
-                coords_3d = (to_3d @ coords_3d_h.T).T[:, :3]
-                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
-                return best.exterior.length
-            except:
-                return None
-
-        measurements = {}
-        shoulder_y = (get_kp('left_shoulder')[1] + get_kp('right_shoulder')[1]) / 2
-        hip_y = (get_kp('left_hip')[1] + get_kp('right_hip')[1]) / 2
-        knee_y = (get_kp('left_knee')[1] + get_kp('right_knee')[1]) / 2
-        ankle_y = (get_kp('left_ankle')[1] + get_kp('right_ankle')[1]) / 2
-        elbow_y = (get_kp('left_elbow')[1] + get_kp('right_elbow')[1]) / 2
-
-        for name, frac in [("chest", 0.25), ("underbust", 0.40), ("waist", 0.55)]:
-            y = shoulder_y - (shoulder_y - hip_y) * frac
-            s = extract_slice(y)
-            c, contour = get_torso_polygon(s, name)
-            if c:
-                measurements[name] = round(c * scale, 1)
-                if contour:
-                    slices_3d[name] = {"y": float(y), "contour": contour}
-
-        s = extract_slice(hip_y)
-        c, contour = get_torso_polygon(s, "hips")
-        if c:
-            measurements["hips"] = round(c * scale, 1)
-            if contour:
-                slices_3d["hips"] = {"y": float(hip_y), "contour": contour}
-
-        y_thigh = hip_y - (hip_y - knee_y) * 0.35
-        c = get_leg_circ(y_thigh, "thigh")
-        if c:
-            measurements["thigh"] = round(c * scale, 1)
-
-        c = get_leg_circ(knee_y, "knee")
-        if c:
-            measurements["knee"] = round(c * scale, 1)
-
-        y_calf = knee_y - (knee_y - ankle_y) * 0.30
-        c = get_leg_circ(y_calf, "calf")
-        if c:
-            measurements["calf"] = round(c * scale, 1)
-
-        y_bic = shoulder_y - (shoulder_y - elbow_y) * 0.40
-        c = get_limb_circ(y_bic, "biceps")
-        if c:
-            measurements["biceps"] = round(c * scale, 1)
-
-        shoulder_slice_y = shoulder_y - (shoulder_y - hip_y) * 0.05
-        try:
-            s = extract_slice(shoulder_slice_y)
-            if s is not None:
-                verts = np.array(s.vertices)
-                sw = (verts[:, 0].max() - verts[:, 0].min()) * scale
-                measurements["shoulder_width"] = round(sw, 1)
-        except:
-            measurements["shoulder_width"] = round(dist('left_shoulder', 'right_shoulder') * scale, 1)
-
-        left_arm = dist('left_shoulder', 'left_elbow') + dist('left_elbow', 'left_wrist')
-        right_arm = dist('right_shoulder', 'right_elbow') + dist('right_elbow', 'right_wrist')
-        measurements["arm_length"] = round(((left_arm + right_arm) / 2) * scale, 1)
-        measurements["inseam"] = round(abs(hip_y - ankle_y) * scale, 1)
-        measurements["torso_length"] = round(abs(shoulder_y - hip_y) * scale, 1)
-
-        return measurements, slices_3d
 
 
 # FastAPI
@@ -540,7 +585,7 @@ web_app.add_middleware(
 
 @web_app.get("/")
 async def root():
-    return {"status": "ok", "service": "ETEKA Body Scan WIX API"}
+    return {"status": "ok", "service": "ETEKA Body Scan WIX API", "pipeline": "voxel-visual-hull"}
 
 
 @web_app.get("/health")

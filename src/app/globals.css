@@ -23,6 +23,12 @@ body {
   margin: 0;
 }
 
+/* Embed mode: transparent so iframe blends with parent (Wix) */
+body.embed,
+html.embed body {
+  background: transparent;
+}
+
 @layer utilities {
   .glass {
     background: rgba(26, 26, 36, 0.8);

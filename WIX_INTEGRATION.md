@@ -1,68 +1,100 @@
 # Integration dans Wix
 
-## Methode 1 : Element HTML (recommandee, la plus simple)
+## URL d'integration
 
-1. Dans votre editeur Wix, cliquez sur **Ajouter** > **Embed Code** > **Embed HTML** (ou **Incorporer HTML**)
-2. Choisissez **Embed a site** (Incorporer un site)
-3. Collez cette URL :
+Utilisez **toujours** l'URL avec `?embed=1` pour l'integration Wix :
 
 ```
-https://eteka-body-scan-wix.vercel.app
+https://eteka-body-scan-wix.vercel.app?embed=1
 ```
 
-4. Ajustez la largeur et hauteur (recommande : pleine largeur, hauteur 900-1200px)
+Le parametre `?embed=1` :
+- Cache le header et footer (votre site Wix garde ses propres elements)
+- Met le fond transparent (l'app prend les couleurs de votre page Wix)
+- Active le **redimensionnement automatique** de l'iframe (postMessage)
 
-## Methode 2 : Code iframe custom
+## Methode 1 : Embed HTML (recommandee)
 
-Pour plus de controle (hauteur dynamique, styling), ajoutez un element **HTML Embed**
-> **HTML Code** et collez :
+1. Dans l'editeur Wix, cliquez sur **+ Ajouter** > **Embed Code** > **Embed HTML** (ou **Code HTML personnalise**)
+2. Selectionnez **HTTP Embed** ou **Code**
+3. Collez le code suivant :
 
 ```html
 <iframe
-  src="https://eteka-body-scan-wix.vercel.app"
+  id="eteka-bodyscan-iframe"
+  src="https://eteka-body-scan-wix.vercel.app?embed=1"
   width="100%"
-  height="1100"
+  height="900"
   frameborder="0"
   allow="camera; microphone; fullscreen"
-  style="border: none; display: block;"
+  style="border: none; display: block; background: transparent;"
 ></iframe>
+
+<script>
+  // Auto-resize iframe based on content height
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.type === "eteka-bodyscan-resize") {
+      var iframe = document.getElementById("eteka-bodyscan-iframe");
+      if (iframe && event.data.height) {
+        iframe.style.height = (event.data.height + 20) + "px";
+      }
+    }
+  });
+</script>
 ```
 
-**Important** : l'attribut `allow="camera"` est necessaire pour que la camera fonctionne
-depuis l'iframe.
+## Methode 2 : Velo (Dev Mode)
 
-## Methode 3 : Velo (code Wix developpeur)
+Si vous etes en mode developpeur Wix :
 
-Si vous avez Wix avec Velo (Dev Mode) :
-
-1. Activez **Developer Tools** > **Enable Dev Mode**
-2. Ajoutez un element `#html1` (Custom Element ou HTML iframe)
-3. Dans le code de page :
+1. Ajoutez un element **HTML iframe** sur votre page (ID par defaut `#html1`)
+2. Dans le panneau Code en bas :
 
 ```javascript
 $w.onReady(function () {
-  $w("#html1").src = "https://eteka-body-scan-wix.vercel.app";
+  $w("#html1").src = "https://eteka-body-scan-wix.vercel.app?embed=1";
+
+  // Auto-resize iframe
+  $w("#html1").onMessage((event) => {
+    if (event.data && event.data.type === "eteka-bodyscan-resize") {
+      $w("#html1").height = event.data.height + 20;
+    }
+  });
 });
 ```
 
+## Methode 3 : Bouton vers nouvelle fenetre (free plan)
+
+Si Wix bloque l'embed (plan gratuit), proposez l'app dans un nouvel onglet :
+
+1. Ajoutez un **bouton** "Scanner ma morphologie"
+2. Lien : `https://eteka-body-scan-wix.vercel.app`
+3. Ouvrir dans : **Nouvelle fenetre**
+
+## Recommandations design
+
+Pour une integration visuelle propre :
+- Mettez l'iframe dans une **section sombre** de votre page Wix (le theme de l'app est sombre)
+- Hauteur initiale recommandee : **900px** (l'auto-resize ajuste apres chargement)
+- Largeur : **100%** (l'app est responsive)
+
 ## Verification
 
-Apres integration :
-- Ouvrez votre page Wix en mode apercu
-- L'app doit se charger dans l'iframe
-- La camera doit demander les permissions
-- Le bouton "Analyser" doit fonctionner
+Apres integration, testez :
+- L'app se charge sans header ETEKA en double
+- L'iframe se redimensionne automatiquement quand le contenu change
+- Le fond est transparent (les couleurs Wix se voient autour)
+- La camera demande les permissions correctement
 
-## Depannage
+## Limitation `allow="camera"`
 
-**La camera ne fonctionne pas :**
-- Verifiez que votre site Wix est en HTTPS
-- Ajoutez `allow="camera; microphone"` dans le code iframe
+Sur certains navigateurs (notamment Safari mobile), l'attribut `allow="camera"` dans
+l'iframe Wix peut etre limite. Dans ce cas, l'utilisateur peut toujours utiliser le
+mode **Upload** au lieu de la camera directe.
 
-**L'iframe ne s'affiche pas :**
-- Les free plans Wix limitent l'embed code. Passez a un plan payant Wix ou
-  contactez-nous pour un deploiement alternatif.
+## URL alternative pour test
 
-**Page blanche dans l'iframe :**
-- Verifiez que l'URL est bien accessible dans un navigateur
-- Inspectez la console pour les erreurs CSP
+Pour tester l'app en plein ecran (avec header/footer) :
+```
+https://eteka-body-scan-wix.vercel.app
+```

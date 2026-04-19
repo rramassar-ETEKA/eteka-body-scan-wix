@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import PoseCapture, { CapturedPose, PoseKey } from "@/components/PoseCapture";
 import VideoCapture360 from "@/components/VideoCapture360";
@@ -34,6 +34,30 @@ export default function Home() {
   const [gender, setGender] = useState<"homme" | "femme">("femme");
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string>("");
+  const [embedMode, setEmbedMode] = useState(false);
+  const mainRef = useRef<HTMLDivElement>(null);
+
+  // Detect embed mode from URL param
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const embed = params.get("embed") === "1";
+    setEmbedMode(embed);
+    if (embed) document.body.classList.add("embed");
+  }, []);
+
+  // PostMessage to parent (Wix iframe) to resize iframe height dynamically
+  useEffect(() => {
+    if (!embedMode || typeof window === "undefined") return;
+    const sendHeight = () => {
+      const h = document.documentElement.scrollHeight;
+      window.parent.postMessage({ type: "eteka-bodyscan-resize", height: h }, "*");
+    };
+    sendHeight();
+    const observer = new ResizeObserver(sendHeight);
+    if (mainRef.current) observer.observe(mainRef.current);
+    return () => observer.disconnect();
+  }, [embedMode, status, result]);
 
   const handlePhotosComplete = (captured: Record<PoseKey, CapturedPose>) => {
     setPhotos(captured);
@@ -144,22 +168,32 @@ export default function Home() {
   const previewUrl = photos?.front.preview || video?.preview;
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="glass sticky top-0 z-50 px-4 py-3">
-        <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <h1 className="text-lg font-bold">
-            <span className="text-[var(--primary-light)]">ETEKA</span>{" "}
-            <span className="text-[var(--foreground)]/60 font-normal">Body Scan</span>
-          </h1>
-          {status !== "idle" && (
-            <button onClick={handleReset} className="text-xs text-[var(--primary-light)] hover:underline">
-              Recommencer
-            </button>
-          )}
-        </div>
-      </header>
+    <div className={`flex flex-col ${embedMode ? "" : "min-h-screen"}`}>
+      {!embedMode && (
+        <header className="glass sticky top-0 z-50 px-4 py-3">
+          <div className="max-w-5xl mx-auto flex items-center justify-between">
+            <h1 className="text-lg font-bold">
+              <span className="text-[var(--primary-light)]">ETEKA</span>{" "}
+              <span className="text-[var(--foreground)]/60 font-normal">Body Scan</span>
+            </h1>
+            {status !== "idle" && (
+              <button onClick={handleReset} className="text-xs text-[var(--primary-light)] hover:underline">
+                Recommencer
+              </button>
+            )}
+          </div>
+        </header>
+      )}
 
-      <main className="flex-1 px-4 py-6 max-w-5xl mx-auto w-full">
+      {embedMode && status !== "idle" && (
+        <div className="flex justify-end px-4 pt-3">
+          <button onClick={handleReset} className="text-xs text-[var(--primary-light)] hover:underline">
+            Recommencer
+          </button>
+        </div>
+      )}
+
+      <main ref={mainRef} className="flex-1 px-4 py-6 max-w-5xl mx-auto w-full">
         {/* Mode selection */}
         {status === "idle" && (
           <div className="space-y-8">
@@ -358,9 +392,11 @@ export default function Home() {
         )}
       </main>
 
-      <footer className="px-4 py-3 text-center text-xs text-[var(--foreground)]/30">
-        ETEKA Body Scan
-      </footer>
+      {!embedMode && (
+        <footer className="px-4 py-3 text-center text-xs text-[var(--foreground)]/30">
+          ETEKA Body Scan
+        </footer>
+      )}
     </div>
   );
 }

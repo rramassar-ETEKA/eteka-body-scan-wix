@@ -455,16 +455,40 @@ class BodyScanner:
 
         return measurements, slices_3d
 
+    def _align_sam3d_mesh(self, sam_vertices, height_cm):
+        """
+        Rescale and translate SAM3D mesh to match visual hull frame:
+        - head at Y=0, feet at Y=height_cm/100 (meters)
+        - centered at origin in X and Z
+        """
+        import numpy as np
+        v = np.array(sam_vertices, dtype=np.float32)
+        y_min = v[:, 1].min()
+        y_max = v[:, 1].max()
+        h = y_max - y_min
+        if h < 1e-6:
+            return v
+        target_h = height_cm / 100.0
+        scale = target_h / h
+        x_mean = v[:, 0].mean()
+        z_mean = v[:, 2].mean()
+        out = v.copy()
+        out[:, 1] = (v[:, 1] - y_min) * scale
+        out[:, 0] = (v[:, 0] - x_mean) * scale
+        out[:, 2] = (v[:, 2] - z_mean) * scale
+        return out
+
     def _do_analyze(self, photos: dict, height_cm: float):
         """
         Hybrid pipeline:
-        1) SAM3D extracts keypoints from front photo
-        2) Voxel visual hull from 4 silhouettes -> true 3D body shape
-        3) Measurements via mesh slicing on visual hull (using SAM3D keypoint Y levels)
+        1) SAM3D mesh -> used for VISUALIZATION (clean body shape)
+        2) Voxel visual hull -> used for MEASUREMENTS (true cross-sections)
+        3) Both meshes are aligned in the same coord frame so slice contours
+           from the visual hull display naturally on the SAM3D mesh.
         """
         import numpy as np
 
-        # 1. SAM3D for keypoints
+        # 1. SAM3D mesh + keypoints
         base = self._reconstruct_keypoints(photos["front"])
         if base is None:
             return {"error": "Personne non detectee sur la photo de face"}
@@ -481,21 +505,22 @@ class BodyScanner:
         if len(silhouettes) < 2:
             return {"error": "Impossible d'extraire les silhouettes"}
 
+        # 3. Voxel visual hull (used for measurements only)
         print(f"Building voxel visual hull from {len(silhouettes)} views...")
-
-        # 3. Voxel visual hull
         vh_mesh = self._voxel_visual_hull(silhouettes, height_cm)
         if vh_mesh is None:
             return {"error": "Reconstruction visual hull echouee"}
+        print(f"Visual hull mesh: {len(vh_mesh.vertices)} verts")
 
-        print(f"Visual hull mesh: {len(vh_mesh.vertices)} verts, {len(vh_mesh.faces)} faces")
+        # 4. Align SAM3D mesh to same frame as visual hull
+        sam_aligned = self._align_sam3d_mesh(np.array(base["vertices"]), height_cm)
 
-        # 4. Align SAM3D keypoints to visual hull frame
+        # 5. Align SAM3D keypoints to that frame too
         kp_aligned = self._align_keypoints_to_visual_hull(
             base["keypoints_3d"], np.array(base["vertices"]), height_cm
         )
 
-        # 5. Measurements from visual hull mesh
+        # 6. Measurements & slice contours from visual hull
         measurements, slices_3d = self._calculate_measurements_from_mesh(
             vh_mesh, kp_aligned, height_cm
         )
@@ -503,9 +528,11 @@ class BodyScanner:
         return {
             "success": True,
             "measurements": measurements,
-            "vertices": vh_mesh.vertices.tolist(),
-            "faces": vh_mesh.faces.tolist(),
+            # SAM3D mesh for visualization (clean body shape)
+            "vertices": sam_aligned.tolist(),
+            "faces": np.array(base["faces"]).tolist(),
             "keypoints_3d": kp_aligned,
+            # Visual hull cross-sections (the "real" measurements)
             "slices": slices_3d,
         }
 

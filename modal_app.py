@@ -79,6 +79,11 @@ image = (
         "mkdir -p /opt/pifuhd/checkpoints && "
         "wget -q https://dl.fbaipublicfiles.com/pifuhd/checkpoints/pifuhd.pt "
         "-O /opt/pifuhd/checkpoints/pifuhd.pt",
+        # Patch PIFuHD for numpy 2.x / 1.24+ compatibility (np.bool removed)
+        "sed -i 's/np.bool)/bool)/g' /opt/pifuhd/lib/sdf.py",
+        "sed -i 's/np.bool_/bool/g' /opt/pifuhd/lib/sdf.py",
+        "grep -rl 'np.int)' /opt/pifuhd/ | xargs -r sed -i 's/np.int)/int)/g'",
+        "grep -rl 'np.float)' /opt/pifuhd/ | xargs -r sed -i 's/np.float)/float)/g'",
     )
 )
 
@@ -514,52 +519,57 @@ class BodyScanner:
     def _do_analyze(self, photos: dict, height_cm: float):
         """
         Pipeline:
-        1) PIFuHD on front photo -> high-quality clothed body mesh (visualization)
-        2) SAM 3D for keypoints (anatomical Y levels)
-        3) Visual hull from 4 silhouettes -> measurement mesh
+        - SAM 3D: keypoints + T-pose mesh for clean MEASUREMENTS (arms don't
+          interfere with torso cross-sections because SAM3D normalizes pose)
+        - PIFuHD: visual mesh for DISPLAY (handles atypical morphologies)
         """
         import numpy as np
+        import trimesh
 
-        # 1. SAM3D for keypoints
+        # 1. SAM3D: keypoints AND T-pose mesh for measurements
         print("Running SAM 3D...")
         sam = self._reconstruct_keypoints(photos["front"])
         if sam is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # 2. Silhouettes
-        print("Extracting silhouettes...")
-        silhouettes = {}
-        bbox_front = None
-        for view_name, img_bytes in photos.items():
-            sil, _ = self._extract_silhouette(img_bytes)
-            if sil is not None:
-                silhouettes[view_name] = sil
-        if len(silhouettes) < 2:
-            return {"error": "Impossible d'extraire les silhouettes"}
-
+        # 2. Bbox on front for PIFuHD
         bbox_front = self._silhouette_bbox_in_image(photos["front"])
 
-        # 3. PIFuHD on front (visualization mesh)
+        # 3. PIFuHD on front for nice visualization
         print("Running PIFuHD...")
         pifu_mesh = self._run_pifuhd(photos["front"], bbox_front) if bbox_front else None
         if pifu_mesh is not None:
             pifu_mesh = self._flip_mesh_if_needed(pifu_mesh)
             pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
 
-        # 4. Visual hull (measurement mesh)
-        print("Building visual hull...")
-        vh_mesh = self._voxel_visual_hull(silhouettes, height_cm)
-        if vh_mesh is None:
-            return {"error": "Reconstruction visual hull echouee"}
+        # 4. Build SAM3D measurement mesh in same coord frame (head at 0, feet at h)
+        sam_vertices = np.array(sam["vertices"])
+        sam_faces = np.array(sam["faces"])
+        sam_y_min = sam_vertices[:, 1].min()
+        sam_y_max = sam_vertices[:, 1].max()
+        sam_h = sam_y_max - sam_y_min
+        target_h = height_cm / 100.0
+        scale = target_h / sam_h if sam_h > 0 else 1.0
+        x_mean = sam_vertices[:, 0].mean()
+        z_mean = sam_vertices[:, 2].mean()
 
-        # 5. Aligned keypoints
-        kp_aligned = self._align_keypoints(sam["keypoints_3d"], np.array(sam["vertices"]), height_cm)
+        sam_aligned = sam_vertices.copy()
+        sam_aligned[:, 1] = (sam_vertices[:, 1] - sam_y_min) * scale
+        sam_aligned[:, 0] = (sam_vertices[:, 0] - x_mean) * scale
+        sam_aligned[:, 2] = (sam_vertices[:, 2] - z_mean) * scale
 
-        # 6. Measurements from visual hull
-        measurements, slices_3d = self._calculate_measurements_from_mesh(vh_mesh, kp_aligned, height_cm)
+        sam_mesh = trimesh.Trimesh(vertices=sam_aligned, faces=sam_faces, process=False)
 
-        # Visualization mesh: PIFuHD if available, else visual hull
-        viz_mesh = pifu_mesh if pifu_mesh is not None else vh_mesh
+        # 5. Aligned keypoints (same frame)
+        kp_aligned = self._align_keypoints(sam["keypoints_3d"], sam_vertices, height_cm)
+
+        # 6. Measurements from SAM3D T-pose mesh (clean torso cross-sections)
+        measurements, slices_3d = self._calculate_measurements_from_mesh(
+            sam_mesh, kp_aligned, height_cm
+        )
+
+        # Visualization mesh: prefer PIFuHD (high-quality), fallback to SAM3D
+        viz_mesh = pifu_mesh if pifu_mesh is not None else sam_mesh
 
         return {
             "success": True,
@@ -568,7 +578,7 @@ class BodyScanner:
             "faces": viz_mesh.faces.tolist(),
             "keypoints_3d": kp_aligned,
             "slices": slices_3d,
-            "viz_source": "pifuhd" if pifu_mesh is not None else "visual_hull",
+            "viz_source": "pifuhd" if pifu_mesh is not None else "sam3d",
         }
 
     @modal.method()

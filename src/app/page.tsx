@@ -112,6 +112,21 @@ export default function Home() {
       }
 
       const data = await res.json();
+      console.log("[Body Scan] Result:", {
+        hasMeasurements: !!data.measurements,
+        measurementKeys: data.measurements ? Object.keys(data.measurements) : [],
+        hasVertices: !!data.vertices,
+        verticesCount: data.vertices?.length || 0,
+        hasFaces: !!data.faces,
+        facesCount: data.faces?.length || 0,
+        hasSlices: !!data.slices,
+        sliceKeys: data.slices ? Object.keys(data.slices) : [],
+      });
+
+      if (!data.measurements) {
+        throw new Error("Reponse invalide: mesures manquantes");
+      }
+
       setResult(data);
       setStatus("done");
     } catch (err) {
@@ -264,6 +279,30 @@ export default function Home() {
               className="w-full py-3.5 rounded-xl font-semibold text-white bg-[var(--primary)] hover:bg-[var(--primary-light)] active:scale-[0.98] transition-all"
             >
               Analyser ma morphologie
+            </button>
+          </div>
+        )}
+
+        {/* Error */}
+        {status === "error" && (
+          <div className="max-w-md mx-auto space-y-4 text-center">
+            <div className="bg-[var(--error)]/10 border border-[var(--error)]/30 rounded-xl p-4 text-sm text-[var(--error)]">
+              {error || "Une erreur est survenue"}
+            </div>
+            <button
+              onClick={() => {
+                setError("");
+                setStatus("form");
+              }}
+              className="w-full py-3 rounded-xl font-semibold text-white bg-[var(--primary)] hover:bg-[var(--primary-light)] transition-all"
+            >
+              Reessayer
+            </button>
+            <button
+              onClick={handleReset}
+              className="text-sm text-[var(--foreground)]/60 hover:text-[var(--foreground)] underline"
+            >
+              Recommencer a zero
             </button>
           </div>
         )}

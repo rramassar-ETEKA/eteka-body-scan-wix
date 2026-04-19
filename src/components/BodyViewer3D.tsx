@@ -88,8 +88,11 @@ export default function BodyViewer3D({ vertices, faces, measurements, keypoints,
 
   useEffect(() => {
     if (!containerRef.current || !vertices || !faces) return;
+    if (vertices.length === 0 || faces.length === 0) return;
 
     if (cleanupRef.current) cleanupRef.current();
+
+    try {
 
     const container = containerRef.current;
     const width = container.clientWidth || 500;
@@ -230,42 +233,43 @@ export default function BodyViewer3D({ vertices, faces, measurements, keypoints,
     // Slice contours (circumference visualization)
     if (slices) {
       for (const [name, sliceData] of Object.entries(slices)) {
-        if (!sliceData.contour || sliceData.contour.length < 3) continue;
+        try {
+          if (!sliceData.contour || sliceData.contour.length < 3) continue;
 
-        const color = SLICE_COLORS[name] || 0xffffff;
+          const color = SLICE_COLORS[name] || 0xffffff;
 
-        // Build closed contour as a tube for thickness
-        const points = sliceData.contour.map(
-          (p) => new THREE.Vector3(p[0] - meshCenter.x, p[1] - meshCenter.y, p[2] - meshCenter.z)
-        );
-        points.push(points[0].clone());
+          const points = sliceData.contour.map(
+            (p) => new THREE.Vector3(p[0] - meshCenter.x, p[1] - meshCenter.y, p[2] - meshCenter.z)
+          );
 
-        const curve = new THREE.CatmullRomCurve3(points, true);
-        const tubeGeom = new THREE.TubeGeometry(curve, points.length * 2, 0.003, 6, true);
-        const tubeMat = new THREE.MeshBasicMaterial({ color });
-        const tube = new THREE.Mesh(tubeGeom, tubeMat);
-        bodyGroup.add(tube);
+          const curve = new THREE.CatmullRomCurve3(points, true);
+          const tubeGeom = new THREE.TubeGeometry(curve, Math.max(points.length * 2, 32), 0.003, 6, true);
+          const tubeMat = new THREE.MeshBasicMaterial({ color });
+          const tube = new THREE.Mesh(tubeGeom, tubeMat);
+          bodyGroup.add(tube);
 
-        // Semi-transparent filled shape
-        const shape = new THREE.Shape();
-        const yLevel = sliceData.contour[0][1] - meshCenter.y;
-        shape.moveTo(sliceData.contour[0][0] - meshCenter.x, sliceData.contour[0][2] - meshCenter.z);
-        for (let i = 1; i < sliceData.contour.length; i++) {
-          shape.lineTo(sliceData.contour[i][0] - meshCenter.x, sliceData.contour[i][2] - meshCenter.z);
+          const shape = new THREE.Shape();
+          const yLevel = sliceData.contour[0][1] - meshCenter.y;
+          shape.moveTo(sliceData.contour[0][0] - meshCenter.x, sliceData.contour[0][2] - meshCenter.z);
+          for (let i = 1; i < sliceData.contour.length; i++) {
+            shape.lineTo(sliceData.contour[i][0] - meshCenter.x, sliceData.contour[i][2] - meshCenter.z);
+          }
+          shape.closePath();
+
+          const shapeGeom = new THREE.ShapeGeometry(shape);
+          const shapeMat = new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.2,
+            side: THREE.DoubleSide,
+          });
+          const shapeMesh = new THREE.Mesh(shapeGeom, shapeMat);
+          shapeMesh.rotation.x = -Math.PI / 2;
+          shapeMesh.position.y = yLevel;
+          bodyGroup.add(shapeMesh);
+        } catch (err) {
+          console.warn(`[Body Scan] Slice ${name} render error:`, err);
         }
-        shape.closePath();
-
-        const shapeGeom = new THREE.ShapeGeometry(shape);
-        const shapeMat = new THREE.MeshBasicMaterial({
-          color,
-          transparent: true,
-          opacity: 0.2,
-          side: THREE.DoubleSide,
-        });
-        const shapeMesh = new THREE.Mesh(shapeGeom, shapeMat);
-        shapeMesh.rotation.x = -Math.PI / 2;
-        shapeMesh.position.y = yLevel;
-        bodyGroup.add(shapeMesh);
       }
     }
 
@@ -333,6 +337,9 @@ export default function BodyViewer3D({ vertices, faces, measurements, keypoints,
     return () => {
       if (cleanupRef.current) cleanupRef.current();
     };
+    } catch (err) {
+      console.error("[Body Scan] Viewer3D init error:", err);
+    }
   }, [vertices, faces, measurements, keypoints, slices, showKeypoints]);
 
   return (

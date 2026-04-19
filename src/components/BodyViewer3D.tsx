@@ -77,7 +77,7 @@ export default function BodyViewer3D({ vertices, faces, measurements, keypoints,
   const containerRef = useRef<HTMLDivElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const keypointGroupRef = useRef<THREE.Group | null>(null);
-  const [showKeypoints, setShowKeypoints] = useState(true);
+  const [showKeypoints, setShowKeypoints] = useState(false);
 
   // Toggle keypoint visibility
   useEffect(() => {

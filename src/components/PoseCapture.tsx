@@ -18,22 +18,22 @@ const POSES: { key: PoseKey; label: string; instruction: string }[] = [
   {
     key: "front",
     label: "Face",
-    instruction: "Face a la camera, bras ecartes a 45 degres, pieds legerement ecartes",
+    instruction: "Face a la camera, bras legerement ecartes du corps, pieds ecartes a largeur d'epaules",
   },
   {
     key: "left",
     label: "Profil gauche",
-    instruction: "Tournez-vous de 90 degres vers votre droite (votre cote gauche face a la camera)",
+    instruction: "Tournez-vous de 90 degres vers votre droite. Bras le long du corps.",
   },
   {
     key: "back",
     label: "Dos",
-    instruction: "Tournez-vous de dos, bras ecartes a 45 degres",
+    instruction: "Tournez-vous de dos. Bras legerement ecartes du corps.",
   },
   {
     key: "right",
     label: "Profil droit",
-    instruction: "Tournez-vous de 90 degres vers votre gauche (votre cote droit face a la camera)",
+    instruction: "Tournez-vous de 90 degres vers votre gauche. Bras le long du corps.",
   },
 ];
 

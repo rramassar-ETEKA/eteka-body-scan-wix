@@ -82,8 +82,10 @@ image = (
         # Patch PIFuHD for numpy 2.x / 1.24+ compatibility (np.bool removed)
         "sed -i 's/np.bool)/bool)/g' /opt/pifuhd/lib/sdf.py",
         "sed -i 's/np.bool_/bool/g' /opt/pifuhd/lib/sdf.py",
-        "grep -rl 'np.int)' /opt/pifuhd/ | xargs -r sed -i 's/np.int)/int)/g'",
-        "grep -rl 'np.float)' /opt/pifuhd/ | xargs -r sed -i 's/np.float)/float)/g'",
+        "grep -rl 'np.int)' /opt/pifuhd/ 2>/dev/null | xargs -r sed -i 's/np.int)/int)/g'",
+        "grep -rl 'np.float)' /opt/pifuhd/ 2>/dev/null | xargs -r sed -i 's/np.float)/float)/g'",
+        # Verify patches
+        "echo '=== sdf.py patch check ===' && grep -n 'np.bool\\|dtype=bool' /opt/pifuhd/lib/sdf.py || true",
     )
 )
 
@@ -238,22 +240,48 @@ class BodyScanner:
                 "--dataroot", in_dir,
                 "--results_path", out_dir,
                 "--loadSize", "1024",
-                "--resolution", "256",  # 256 = fast, 512 = better; we use 256 for speed
+                "--resolution", "256",
                 "--load_netMR_checkpoint_path", "/opt/pifuhd/checkpoints/pifuhd.pt",
                 "--start_id", "-1",
                 "--end_id", "-1",
             ]
             print("Running PIFuHD...")
-            reconWrapper(cmd, use_rect=True)
+            try:
+                reconWrapper(cmd, use_rect=True)
+            except Exception as e:
+                print(f"reconWrapper raised: {e}")
+                import traceback
+                traceback.print_exc()
 
-            # Find output .obj
-            obj_files = glob.glob(os.path.join(out_dir, "**", "*.obj"), recursive=True)
+            # List everything that was created
+            created_files = []
+            for root, dirs, files in os.walk(out_dir):
+                for f in files:
+                    p = os.path.join(root, f)
+                    created_files.append(p)
+            print(f"PIFuHD produced {len(created_files)} file(s) in {out_dir}:")
+            for f in created_files[:20]:
+                print(f"  {f}")
+
+            obj_files = [f for f in created_files if f.endswith(".obj")]
             if not obj_files:
-                print(f"No PIFuHD output found in {out_dir}")
                 return None
 
             mesh = trimesh.load(obj_files[0], process=False)
-            print(f"PIFuHD mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+            print(f"PIFuHD raw mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+
+            # Keep only the largest connected component (filter out floating
+            # fragments like detached hands, face pieces)
+            try:
+                components = mesh.split(only_watertight=False)
+                if len(components) > 1:
+                    largest = max(components, key=lambda c: len(c.vertices))
+                    print(f"Filtered {len(components)} components -> kept largest "
+                          f"({len(largest.vertices)} verts)")
+                    mesh = largest
+            except Exception as e:
+                print(f"Component split failed: {e}")
+
             return mesh
         except Exception as e:
             print(f"PIFuHD failed: {e}")

@@ -14,30 +14,26 @@ interface PoseCaptureProps {
   onComplete: (photos: Record<PoseKey, CapturedPose>) => void;
 }
 
-const POSES: { key: PoseKey; label: string; instruction: string; icon: string }[] = [
+const POSES: { key: PoseKey; label: string; instruction: string }[] = [
   {
     key: "front",
     label: "Face",
     instruction: "Face a la camera, bras ecartes a 45 degres, pieds legerement ecartes",
-    icon: "⬆",
   },
   {
     key: "left",
     label: "Profil gauche",
     instruction: "Tournez-vous de 90 degres vers votre droite (votre cote gauche face a la camera)",
-    icon: "⬅",
   },
   {
     key: "back",
     label: "Dos",
     instruction: "Tournez-vous de dos, bras ecartes a 45 degres",
-    icon: "⬇",
   },
   {
     key: "right",
     label: "Profil droit",
     instruction: "Tournez-vous de 90 degres vers votre gauche (votre cote droit face a la camera)",
-    icon: "➡",
   },
 ];
 
@@ -166,7 +162,6 @@ export default function PoseCapture({ onComplete }: PoseCaptureProps) {
             onClick={() => setUseCamera(true)}
             className="glass rounded-xl p-6 hover:bg-[var(--surface-light)] transition-colors"
           >
-            <div className="text-3xl mb-2">📷</div>
             <div className="font-medium">Camera</div>
             <div className="text-xs text-[var(--foreground)]/60 mt-1">Directement via l&apos;appareil</div>
           </button>
@@ -174,7 +169,6 @@ export default function PoseCapture({ onComplete }: PoseCaptureProps) {
             onClick={() => setUseCamera(false)}
             className="glass rounded-xl p-6 hover:bg-[var(--surface-light)] transition-colors"
           >
-            <div className="text-3xl mb-2">📁</div>
             <div className="font-medium">Upload</div>
             <div className="text-xs text-[var(--foreground)]/60 mt-1">Photos deja prises</div>
           </button>
@@ -211,7 +205,6 @@ export default function PoseCapture({ onComplete }: PoseCaptureProps) {
 
       {/* Current pose instruction */}
       <div className="glass rounded-xl p-4 text-center">
-        <div className="text-2xl mb-1">{currentPose.icon}</div>
         <h3 className="font-semibold text-[var(--primary-light)]">Pose {currentPoseIdx + 1}/4 : {currentPose.label}</h3>
         <p className="text-sm text-[var(--foreground)]/70 mt-1">{currentPose.instruction}</p>
       </div>
@@ -289,8 +282,8 @@ export default function PoseCapture({ onComplete }: PoseCaptureProps) {
                     </button>
                   </>
                 ) : (
-                  <div className="w-full aspect-[3/4] rounded-lg border-2 border-dashed border-[var(--border)] flex items-center justify-center text-[var(--foreground)]/30">
-                    {pose.icon}
+                  <div className="w-full aspect-[3/4] rounded-lg border-2 border-dashed border-[var(--border)] flex items-center justify-center text-xs text-[var(--foreground)]/30">
+                    {pose.label}
                   </div>
                 )}
               </div>

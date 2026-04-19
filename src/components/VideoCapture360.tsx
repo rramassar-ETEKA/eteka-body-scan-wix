@@ -98,7 +98,6 @@ export default function VideoCapture360({ onComplete }: VideoCapture360Props) {
             onClick={() => setUseCamera(true)}
             className="glass rounded-xl p-6 hover:bg-[var(--surface-light)] transition-colors"
           >
-            <div className="text-3xl mb-2">📹</div>
             <div className="font-medium">Enregistrer</div>
             <div className="text-xs text-[var(--foreground)]/60 mt-1">Via la camera</div>
           </button>
@@ -106,7 +105,6 @@ export default function VideoCapture360({ onComplete }: VideoCapture360Props) {
             onClick={() => setUseCamera(false)}
             className="glass rounded-xl p-6 hover:bg-[var(--surface-light)] transition-colors"
           >
-            <div className="text-3xl mb-2">📁</div>
             <div className="font-medium">Upload</div>
             <div className="text-xs text-[var(--foreground)]/60 mt-1">Video deja enregistree</div>
           </button>

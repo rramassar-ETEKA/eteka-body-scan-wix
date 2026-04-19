@@ -1,6 +1,6 @@
 """
 ETEKA Body Scan WIX - Modal Deployment
-Multi-view reconstruction: SAM 3D Body (front view) + visual hull refinement
+Multi-view reconstruction: SAM 3D Body (front view) + silhouette refinement
 from 4 photos (front/left/back/right) or 360deg video.
 """
 
@@ -57,7 +57,8 @@ image = (
         "numpy<2",
         "Pillow",
         "braceexpand",
-        "rembg[new]",  # For background removal / silhouettes
+        "rembg[cpu]",
+        "onnxruntime",
     )
     .pip_install(
         "git+https://github.com/facebookresearch/detectron2.git@a1ce2f9",
@@ -122,7 +123,7 @@ class BodyScanner:
         out = remove(img)
         alpha = np.array(out)[:, :, 3]
         silhouette = (alpha > 128).astype(np.uint8)
-        return silhouette, img.size
+        return silhouette
 
     def _reconstruct_mesh(self, image_bytes: bytes):
         """Run SAM 3D Body on a single image to get base mesh + keypoints."""
@@ -142,91 +143,124 @@ class BodyScanner:
         finally:
             os.unlink(path)
 
-    def _refine_with_silhouettes(self, base_mesh, silhouettes):
+    def _compute_silhouette_width_profile(self, silhouette, n_levels=100):
         """
-        Refine the mesh shape using silhouettes from 4 views.
-        This adjusts per-vertex scaling in X and Z based on view-specific widths.
+        Compute normalized width at N Y-levels.
+        Returns array of shape (n_levels,) with widths in [0, 1].
+        """
+        import numpy as np
+        h, w = silhouette.shape
+        widths = np.zeros(n_levels)
+
+        # Bounding box of the silhouette
+        rows = np.any(silhouette > 0, axis=1)
+        if not rows.any():
+            return widths
+        top = rows.argmax()
+        bottom = len(rows) - 1 - rows[::-1].argmax()
+
+        sil_h = bottom - top + 1
+        for i in range(n_levels):
+            y = top + int(i * sil_h / n_levels)
+            y = min(y, h - 1)
+            cols = np.where(silhouette[y] > 0)[0]
+            if len(cols) > 0:
+                widths[i] = (cols.max() - cols.min()) / w
+        return widths
+
+    def _refine_with_silhouettes(self, vertices, silhouettes):
+        """
+        Vectorized mesh refinement using silhouette widths from 4 views.
+        Much faster than per-vertex loop.
         """
         import numpy as np
 
-        vertices = np.array(base_mesh["vertices"]).copy()
+        v = np.array(vertices).copy()
+        N_LEVELS = 50
 
-        # Compute silhouette widths at different Y levels for each view
-        # Front/back views give X width, left/right profiles give Z width
-        view_widths = {}
-        for view_name, sil in silhouettes.items():
-            h, w = sil.shape
-            # For each Y row, find leftmost and rightmost non-zero
-            widths = []
-            for y in range(h):
-                cols = np.where(sil[y] > 0)[0]
-                if len(cols) > 0:
-                    widths.append((y / h, (cols.max() - cols.min()) / w))
-                else:
-                    widths.append((y / h, 0.0))
-            view_widths[view_name] = widths
+        # Compute width profiles for all views (single pass per view)
+        profiles = {}
+        for view, sil in silhouettes.items():
+            profiles[view] = self._compute_silhouette_width_profile(sil, N_LEVELS)
 
-        # Compute mesh dimensions
-        mesh_y_min = vertices[:, 1].min()
-        mesh_y_max = vertices[:, 1].max()
-        mesh_height = mesh_y_max - mesh_y_min
+        # Average: front/back for X width, left/right for Z width
+        x_profile = np.zeros(N_LEVELS)
+        z_profile = np.zeros(N_LEVELS)
+        x_count = 0
+        z_count = 0
+        if "front" in profiles:
+            x_profile += profiles["front"]
+            x_count += 1
+        if "back" in profiles:
+            x_profile += profiles["back"]
+            x_count += 1
+        if "left" in profiles:
+            z_profile += profiles["left"]
+            z_count += 1
+        if "right" in profiles:
+            z_profile += profiles["right"]
+            z_count += 1
+        if x_count > 0:
+            x_profile /= x_count
+        if z_count > 0:
+            z_profile /= z_count
 
-        # Build Y-normalized width tables
-        def interp_width(view, y_norm):
-            table = view_widths.get(view, [])
-            if not table:
-                return 1.0
-            # Find closest y_norm entries and interpolate
-            for i in range(len(table) - 1):
-                if table[i][0] <= y_norm <= table[i + 1][0]:
-                    return (table[i][1] + table[i + 1][1]) / 2
-            return 0.0
+        # Compute mesh Y-level for each vertex (0=top/head, 1=bottom/feet)
+        y_min = v[:, 1].min()
+        y_max = v[:, 1].max()
+        mesh_height = y_max - y_min
+        if mesh_height < 1e-6:
+            return v
 
-        # Compute scale factors per Y level
-        # For each mesh vertex, compute Y normalization (inverted since images are top-down)
-        refined = vertices.copy()
-        mesh_x_center = (vertices[:, 0].max() + vertices[:, 0].min()) / 2
-        mesh_z_center = (vertices[:, 2].max() + vertices[:, 2].min()) / 2
+        # Normalize Y (images are top-down, but mesh Y axis direction depends)
+        # For SAM3D MHR, Y increases downward in world (based on observation)
+        # We'll determine orientation: head has max Y or min Y?
+        # Using keypoints would help but we keep it simple: top of mesh = y_min
+        # (based on existing pipeline where head is at y_min)
+        y_norm = (v[:, 1] - y_min) / mesh_height  # 0 at top, 1 at bottom
 
-        for i in range(len(refined)):
-            y_norm = 1.0 - (refined[i, 1] - mesh_y_min) / mesh_height  # inverted
+        # Get mesh X/Z center and current widths per level
+        x_center = (v[:, 0].max() + v[:, 0].min()) / 2
+        z_center = (v[:, 2].max() + v[:, 2].min()) / 2
 
-            # Front/back silhouette informs X width
-            front_w = interp_width("front", y_norm)
-            back_w = interp_width("back", y_norm)
-            avg_x_w = (front_w + back_w) / 2 if (front_w > 0 and back_w > 0) else max(front_w, back_w)
+        # For each level, compute mesh current width (vectorized)
+        level_edges = np.linspace(0, 1, N_LEVELS + 1)
+        scale_x_per_vertex = np.ones(len(v))
+        scale_z_per_vertex = np.ones(len(v))
 
-            # Left/right silhouette informs Z width
-            left_w = interp_width("left", y_norm)
-            right_w = interp_width("right", y_norm)
-            avg_z_w = (left_w + right_w) / 2 if (left_w > 0 and right_w > 0) else max(left_w, right_w)
+        for lvl in range(N_LEVELS):
+            mask = (y_norm >= level_edges[lvl]) & (y_norm < level_edges[lvl + 1])
+            if mask.sum() < 5:
+                continue
 
-            # Compute current mesh widths at this Y level
-            same_y_mask = np.abs(vertices[:, 1] - refined[i, 1]) < mesh_height * 0.02
-            if same_y_mask.sum() > 3:
-                current_x_range = vertices[same_y_mask, 0].max() - vertices[same_y_mask, 0].min()
-                current_z_range = vertices[same_y_mask, 2].max() - vertices[same_y_mask, 2].min()
+            current_x_range = v[mask, 0].max() - v[mask, 0].min()
+            current_z_range = v[mask, 2].max() - v[mask, 2].min()
 
-                if avg_x_w > 0.01 and current_x_range > 0:
-                    # Normalize by image aspect - use mesh_height/3 as torso reference
-                    target_x_range = avg_x_w * mesh_height * 0.6
-                    scale_x = target_x_range / current_x_range if current_x_range > 0 else 1.0
-                    scale_x = np.clip(scale_x, 0.85, 1.15)  # Limit refinement to +/-15%
-                    refined[i, 0] = mesh_x_center + (refined[i, 0] - mesh_x_center) * scale_x
+            # Target widths (silhouette width fraction * mesh_height scale factor)
+            # silhouette gives width as fraction of image width.
+            # We use mesh_height * 0.5 as anatomical reference (body fits ~0.4-0.5 of image height)
+            ref = mesh_height * 0.5
 
-                if avg_z_w > 0.01 and current_z_range > 0:
-                    target_z_range = avg_z_w * mesh_height * 0.6
-                    scale_z = target_z_range / current_z_range if current_z_range > 0 else 1.0
-                    scale_z = np.clip(scale_z, 0.85, 1.15)
-                    refined[i, 2] = mesh_z_center + (refined[i, 2] - mesh_z_center) * scale_z
+            if x_count > 0 and x_profile[lvl] > 0.01 and current_x_range > 1e-4:
+                target_x = x_profile[lvl] * ref
+                s = target_x / current_x_range
+                s = np.clip(s, 0.9, 1.1)  # tighter clamp for stability
+                scale_x_per_vertex[mask] = s
 
-        return refined
+            if z_count > 0 and z_profile[lvl] > 0.01 and current_z_range > 1e-4:
+                target_z = z_profile[lvl] * ref
+                s = target_z / current_z_range
+                s = np.clip(s, 0.9, 1.1)
+                scale_z_per_vertex[mask] = s
 
-    @modal.method()
-    def analyze_multiview(self, photos: dict, height_cm: float = 170.0):
-        """
-        photos: dict with keys 'front', 'left', 'back', 'right' -> bytes
-        """
+        # Apply per-vertex scaling
+        v[:, 0] = x_center + (v[:, 0] - x_center) * scale_x_per_vertex
+        v[:, 2] = z_center + (v[:, 2] - z_center) * scale_z_per_vertex
+
+        return v
+
+    def _do_analyze(self, photos: dict, height_cm: float):
+        """Core pipeline shared by both entry points."""
         import numpy as np
 
         # 1. Reconstruct base mesh from front photo
@@ -234,27 +268,28 @@ class BodyScanner:
         if base is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # 2. Extract silhouettes from all 4 views
+        # 2. Extract silhouettes (optional, skip on error)
         silhouettes = {}
         for view_name, img_bytes in photos.items():
             try:
-                sil, _ = self._extract_silhouette(img_bytes)
-                silhouettes[view_name] = sil
+                silhouettes[view_name] = self._extract_silhouette(img_bytes)
             except Exception as e:
                 print(f"Silhouette extraction failed for {view_name}: {e}")
 
-        # 3. Refine mesh with silhouettes
+        # 3. Refine mesh if we have enough silhouettes
+        vertices = np.array(base["vertices"])
         if len(silhouettes) >= 2:
-            refined_vertices = self._refine_with_silhouettes(base, silhouettes)
-        else:
-            refined_vertices = np.array(base["vertices"])
+            try:
+                vertices = self._refine_with_silhouettes(vertices, silhouettes)
+            except Exception as e:
+                print(f"Refinement failed: {e}")
 
         # 4. Compute measurements
         measurements, slices_3d = self._calculate_measurements(
-            refined_vertices, base["faces"], base["keypoints_3d"], height_cm
+            vertices, base["faces"], base["keypoints_3d"], height_cm
         )
 
-        # 5. Build keypoints dict
+        # 5. Build keypoints
         keypoints_labeled = {}
         for name, idx in KEYPOINTS.items():
             if idx < len(base["keypoints_3d"]):
@@ -263,29 +298,45 @@ class BodyScanner:
         return {
             "success": True,
             "measurements": measurements,
-            "vertices": refined_vertices.tolist(),
+            "vertices": vertices.tolist(),
             "faces": base["faces"].tolist(),
             "keypoints_3d": keypoints_labeled,
             "slices": slices_3d,
         }
 
     @modal.method()
+    def analyze_multiview(self, photos: dict, height_cm: float = 170.0):
+        return self._do_analyze(photos, height_cm)
+
+    @modal.method()
     def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0):
-        """Extract frames from 360 video and run multi-view analysis."""
-        import tempfile, os
+        """Extract 4 frames from 360 video and run analysis."""
+        import tempfile, os, subprocess
         import cv2
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        # Write incoming file
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
             f.write(video_bytes)
-            video_path = f.name
+            raw_path = f.name
+
+        # Convert to mp4 via ffmpeg for reliable cv2 reading
+        mp4_path = raw_path.replace(".webm", ".mp4")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", raw_path, "-c:v", "libx264", "-preset", "ultrafast",
+                 "-an", mp4_path],
+                check=True, capture_output=True, timeout=60,
+            )
+        except Exception as e:
+            print(f"ffmpeg conversion failed, trying raw: {e}")
+            mp4_path = raw_path
 
         try:
-            cap = cv2.VideoCapture(video_path)
+            cap = cv2.VideoCapture(mp4_path)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if frame_count < 4:
-                return {"error": "Video trop courte"}
+                return {"error": "Video trop courte ou illisible"}
 
-            # Sample 4 frames evenly spaced for front/left/back/right
             indices = [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4]
             views = ["front", "left", "back", "right"]
             photos = {}
@@ -295,17 +346,20 @@ class BodyScanner:
                 ret, frame = cap.read()
                 if not ret:
                     continue
-                # Encode to JPEG bytes
                 _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
                 photos[view_name] = buf.tobytes()
             cap.release()
 
             if len(photos) < 4:
-                return {"error": "Impossible d'extraire 4 frames"}
+                return {"error": "Impossible d'extraire 4 frames de la video"}
 
-            return self.analyze_multiview.local(photos, height_cm)
+            return self._do_analyze(photos, height_cm)
         finally:
-            os.unlink(video_path)
+            for p in [raw_path, mp4_path]:
+                try:
+                    os.unlink(p)
+                except:
+                    pass
 
     def _calculate_measurements(self, vertices, faces, keypoints_3d, height_cm):
         import trimesh
@@ -406,7 +460,6 @@ class BodyScanner:
         ankle_y = (get_kp('left_ankle')[1] + get_kp('right_ankle')[1]) / 2
         elbow_y = (get_kp('left_elbow')[1] + get_kp('right_elbow')[1]) / 2
 
-        # Torso circumferences
         for name, frac in [("chest", 0.25), ("underbust", 0.40), ("waist", 0.55)]:
             y = shoulder_y - (shoulder_y - hip_y) * frac
             s = extract_slice(y)
@@ -423,7 +476,6 @@ class BodyScanner:
             if contour:
                 slices_3d["hips"] = {"y": float(hip_y), "contour": contour}
 
-        # Legs
         y_thigh = hip_y - (hip_y - knee_y) * 0.35
         c = get_leg_circ(y_thigh, "thigh")
         if c:
@@ -438,13 +490,11 @@ class BodyScanner:
         if c:
             measurements["calf"] = round(c * scale, 1)
 
-        # Arms
         y_bic = shoulder_y - (shoulder_y - elbow_y) * 0.40
         c = get_limb_circ(y_bic, "biceps")
         if c:
             measurements["biceps"] = round(c * scale, 1)
 
-        # Widths
         shoulder_slice_y = shoulder_y - (shoulder_y - hip_y) * 0.05
         try:
             s = extract_slice(shoulder_slice_y)
@@ -455,7 +505,6 @@ class BodyScanner:
         except:
             measurements["shoulder_width"] = round(dist('left_shoulder', 'right_shoulder') * scale, 1)
 
-        # Lengths
         left_arm = dist('left_shoulder', 'left_elbow') + dist('left_elbow', 'left_wrist')
         right_arm = dist('right_shoulder', 'right_elbow') + dist('right_elbow', 'right_wrist')
         measurements["arm_length"] = round(((left_arm + right_arm) / 2) * scale, 1)

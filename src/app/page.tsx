@@ -110,11 +110,8 @@ export default function Home() {
         {/* Mode selection */}
         {status === "idle" && (
           <div className="space-y-8">
-            <div className="text-center space-y-2">
-              <h2 className="text-2xl font-bold">Analysez votre morphologie by ETEKA</h2>
-              <p className="text-sm text-[var(--foreground)]/60">
-                Precision jusqu&apos;a +/- 2 cm avec reconstruction 3D multi-vue
-              </p>
+            <div className="text-center">
+              <h2 className="text-2xl font-bold">Analysez votre morphologie</h2>
             </div>
 
             <div className="grid md:grid-cols-2 gap-4 max-w-3xl mx-auto">
@@ -123,18 +120,12 @@ export default function Home() {
                   setMode("standard");
                   setStatus("capturing");
                 }}
-                className="glass rounded-2xl p-6 text-left hover:bg-[var(--surface-light)] transition-colors"
+                className="glass rounded-2xl p-8 text-left hover:bg-[var(--surface-light)] transition-colors"
               >
-                <div className="text-3xl mb-2">📸</div>
-                <h3 className="font-semibold text-[var(--primary-light)] mb-1">Mode Standard</h3>
-                <p className="text-sm text-[var(--foreground)]/60 mb-3">
+                <h3 className="font-semibold text-[var(--primary-light)] text-lg mb-2">Mode Standard</h3>
+                <p className="text-sm text-[var(--foreground)]/60">
                   4 photos : face, dos, profil gauche et droit
                 </p>
-                <div className="text-xs space-y-1 text-[var(--foreground)]/50">
-                  <div>⏱ ~60 secondes</div>
-                  <div>🎯 Precision +/- 2-3 cm</div>
-                  <div>📱 Compatible mobile</div>
-                </div>
               </button>
 
               <button
@@ -142,23 +133,17 @@ export default function Home() {
                   setMode("premium");
                   setStatus("capturing");
                 }}
-                className="glass rounded-2xl p-6 text-left hover:bg-[var(--surface-light)] transition-colors border-2 border-[var(--accent)]/30"
+                className="glass rounded-2xl p-8 text-left hover:bg-[var(--surface-light)] transition-colors border-2 border-[var(--accent)]/30"
               >
-                <div className="flex items-start justify-between">
-                  <div className="text-3xl mb-2">🎥</div>
+                <div className="flex items-start justify-between mb-2">
+                  <h3 className="font-semibold text-[var(--accent)] text-lg">Scan 360&deg;</h3>
                   <span className="text-xs bg-[var(--accent)] text-black px-2 py-0.5 rounded-full font-semibold">
                     PREMIUM
                   </span>
                 </div>
-                <h3 className="font-semibold text-[var(--accent)] mb-1">Scan 360°</h3>
-                <p className="text-sm text-[var(--foreground)]/60 mb-3">
-                  Video 360° pour une reconstruction ultra-detaillee
+                <p className="text-sm text-[var(--foreground)]/60">
+                  Video 360&deg; pour une reconstruction detaillee
                 </p>
-                <div className="text-xs space-y-1 text-[var(--foreground)]/50">
-                  <div>⏱ ~3 minutes</div>
-                  <div>🎯 Precision +/- 1 cm</div>
-                  <div>✨ Mesh haute definition</div>
-                </div>
               </button>
             </div>
           </div>

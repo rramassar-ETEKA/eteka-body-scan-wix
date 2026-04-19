@@ -1,13 +1,13 @@
 """
 ETEKA Body Scan WIX - Modal Deployment
 
-Pipeline:
-- PIFuHD (Facebook Research) reconstructs a high-detail clothed body mesh from
-  the front photo. Captures atypical morphologies (pregnancy, etc.) because it's
-  a non-parametric implicit function trained on millions of humans.
-- SAM 3D Body provides anatomical keypoints (shoulder/hip/knee Y levels).
-- Voxel visual hull from 4 silhouettes provides accurate cross-section dimensions.
-- Measurements are extracted from the visual hull mesh at SAM3D keypoint Y levels.
+Fully non-parametric pipeline:
+- PIFuHD (Facebook Research) reconstructs a high-detail 3D body mesh from the
+  front photo. Non-parametric: captures atypical morphologies (pregnancy, etc.).
+- MediaPipe Pose detects 2D/3D keypoints directly on the photo and maps them
+  onto the PIFuHD mesh frame. Keypoints align exactly with the visible body.
+- Measurements are computed by slicing the PIFuHD mesh at MediaPipe keypoint
+  Y levels.
 """
 
 import modal
@@ -27,34 +27,10 @@ image = (
     .pip_install(
         "torch==2.5.1",
         "torchvision==0.20.1",
-        "pytorch-lightning==2.6.0",
-        "pyrender",
         "opencv-python",
-        "yacs",
         "scikit-image",
         "scipy",
         "einops",
-        "timm==1.0.22",
-        "dill",
-        "pandas",
-        "rich",
-        "hydra-core==1.3.2",
-        "hydra-colorlog",
-        "pyrootutils",
-        "chumpy",
-        "networkx==3.2.1",
-        "roma",
-        "joblib",
-        "seaborn",
-        "appdirs",
-        "loguru",
-        "optree",
-        "fvcore",
-        "pycocotools",
-        "huggingface_hub",
-        "smplx",
-        "webdataset",
-        "omegaconf",
         "fastapi",
         "python-multipart",
         "trimesh",
@@ -62,20 +38,14 @@ image = (
         "rtree",
         "numpy<2",
         "Pillow",
-        "braceexpand",
         "rembg[cpu]",
         "onnxruntime",
         "tqdm",
         "matplotlib",
-    )
-    .pip_install(
-        "git+https://github.com/facebookresearch/detectron2.git@a1ce2f9",
-        extra_options="--no-build-isolation --no-deps",
+        "mediapipe",
     )
     .run_commands(
-        "git clone https://github.com/facebookresearch/sam-3d-body.git /opt/sam-3d-body",
         "git clone https://github.com/facebookresearch/pifuhd.git /opt/pifuhd",
-        # Download PIFuHD checkpoint (~1.5 GB)
         "mkdir -p /opt/pifuhd/checkpoints && "
         "wget -q https://dl.fbaipublicfiles.com/pifuhd/checkpoints/pifuhd.pt "
         "-O /opt/pifuhd/checkpoints/pifuhd.pt",
@@ -84,21 +54,19 @@ image = (
         "sed -i 's/np.bool_/bool/g' /opt/pifuhd/lib/sdf.py",
         "grep -rl 'np.int)' /opt/pifuhd/ 2>/dev/null | xargs -r sed -i 's/np.int)/int)/g'",
         "grep -rl 'np.float)' /opt/pifuhd/ 2>/dev/null | xargs -r sed -i 's/np.float)/float)/g'",
-        # Verify patches
-        "echo '=== sdf.py patch check ===' && grep -n 'np.bool\\|dtype=bool' /opt/pifuhd/lib/sdf.py || true",
     )
 )
 
-KEYPOINTS = {
+
+# MediaPipe Pose keypoint indices
+MP_LANDMARKS = {
     'nose': 0,
-    'left_shoulder': 5, 'right_shoulder': 6,
-    'left_elbow': 7, 'right_elbow': 8,
-    'left_hip': 9, 'right_hip': 10,
-    'left_knee': 11, 'right_knee': 12,
-    'left_ankle': 13, 'right_ankle': 14,
-    'right_wrist': 41, 'left_wrist': 62,
-    'left_acromion': 67, 'right_acromion': 68,
-    'neck': 69,
+    'left_shoulder': 11, 'right_shoulder': 12,
+    'left_elbow': 13, 'right_elbow': 14,
+    'left_wrist': 15, 'right_wrist': 16,
+    'left_hip': 23, 'right_hip': 24,
+    'left_knee': 25, 'right_knee': 26,
+    'left_ankle': 27, 'right_ankle': 28,
 }
 
 
@@ -113,26 +81,13 @@ class BodyScanner:
 
     @modal.enter()
     def load_models(self):
-        import sys
-        sys.path.insert(0, "/opt/sam-3d-body")
-        sys.path.insert(0, "/opt/pifuhd")
+        import mediapipe as mp
+        print("Loading MediaPipe Pose...")
+        self.mp_pose = mp.solutions.pose
+        print("MediaPipe ready. PIFuHD loads on first use.")
 
-        from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
-
-        print("Loading SAM 3D Body model...")
-        self.sam_model, self.sam_cfg = load_sam_3d_body(
-            checkpoint_path="/checkpoints/sam-3d-body-dinov3/model.ckpt",
-            mhr_path="/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt"
-        )
-        self.sam_estimator = SAM3DBodyEstimator(
-            sam_3d_body_model=self.sam_model, model_cfg=self.sam_cfg,
-            human_detector=None, human_segmentor=None, fov_estimator=None
-        )
-        print("SAM 3D loaded.")
-        print("PIFuHD will be loaded on first use.")
-
-    def _extract_silhouette(self, image_bytes):
-        """Return cropped binary silhouette (body bbox)."""
+    def _silhouette_and_bbox(self, image_bytes):
+        """Return cropped silhouette + bbox (x1, y1, x2, y2) + image size."""
         from rembg import remove
         from PIL import Image
         import numpy as np
@@ -145,61 +100,89 @@ class BodyScanner:
         rows = np.any(sil > 0, axis=1)
         cols = np.any(sil > 0, axis=0)
         if not rows.any() or not cols.any():
-            return None, None
+            return None, None, img.size
         top = rows.argmax()
         bottom = len(rows) - 1 - rows[::-1].argmax()
         left = cols.argmax()
         right = len(cols) - 1 - cols[::-1].argmax()
-        return sil[top:bottom + 1, left:right + 1].astype(bool), (top, bottom, left, right)
+        return sil[top:bottom + 1, left:right + 1].astype(bool), (left, top, right, bottom), img.size
 
-    def _silhouette_bbox_in_image(self, image_bytes):
-        """Get the body bbox in the original image coords."""
-        from rembg import remove
+    def _detect_pose_keypoints(self, image_bytes, bbox, img_size):
+        """
+        Detect 2D/3D pose keypoints using MediaPipe Pose.
+        Returns keypoints mapped to PIFuHD mesh frame:
+          - Y: normalized relative to body bbox (0=top/head, 1=bottom/feet)
+          - X, Z: normalized relative to body center
+        """
+        import mediapipe as mp
         from PIL import Image
         import numpy as np
         import io
 
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        out = remove(img)
-        alpha = np.array(out)[:, :, 3]
-        sil = (alpha > 128).astype(np.uint8)
-        rows = np.any(sil > 0, axis=1)
-        cols = np.any(sil > 0, axis=0)
-        if not rows.any() or not cols.any():
+        img_np = np.array(img)
+
+        with self.mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=2,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+        ) as pose:
+            results = pose.process(img_np)
+
+        if not results.pose_landmarks:
             return None
-        top = rows.argmax()
-        bottom = len(rows) - 1 - rows[::-1].argmax()
-        left = cols.argmax()
-        right = len(cols) - 1 - cols[::-1].argmax()
-        return left, top, right, bottom, img.size  # bbox + image size
 
-    def _reconstruct_keypoints(self, image_bytes):
-        """SAM3D keypoints (mesh discarded after this)."""
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            f.write(image_bytes)
-            path = f.name
-        try:
-            outputs = self.sam_estimator.process_one_image(path)
-            if not outputs:
-                return None
-            return {
-                "vertices": outputs[0]['pred_vertices'],
-                "faces": self.sam_estimator.faces,
-                "keypoints_3d": outputs[0]['pred_keypoints_3d'],
-            }
-        finally:
-            os.unlink(path)
+        W, H = img_size
+        x1, y1, x2, y2 = bbox
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
 
-    def _run_pifuhd(self, image_bytes, bbox_in_image):
+        kp_norm = {}
+        for name, idx in MP_LANDMARKS.items():
+            lm = results.pose_landmarks.landmark[idx]
+            if lm.visibility < 0.3:
+                continue
+            # Pixel coords in the full image
+            px = lm.x * W
+            py = lm.y * H
+            # Normalize to bbox frame [0,1] (0=top of body, 1=bottom)
+            u = (px - x1) / bbox_w
+            v = (py - y1) / bbox_h
+            # lm.z is relative depth (not reliable), set roughly to 0
+            kp_norm[name] = {'u': float(u), 'v': float(v), 'z': float(lm.z)}
+        return kp_norm
+
+    def _map_kp_to_mesh(self, kp_norm, mesh_bounds, height_cm):
         """
-        Run PIFuHD on the image to get a clothed body mesh.
-        Returns trimesh.Trimesh in arbitrary coords (will rescale later).
+        Map normalized keypoints (u in [0,1] X, v in [0,1] Y top-down) to PIFuHD mesh frame:
+          - mesh Y: 0=head, height_m=feet  (matches v)
+          - mesh X: centered, range ~[-body_w_m/2, +body_w_m/2]
+          - Z: approximate (0 at center)
         """
-        import os, sys, tempfile, shutil, glob
+        target_h = height_cm / 100.0
+        # mesh_bounds = [[x_min, y_min, z_min], [x_max, y_max, z_max]]
+        x_min, y_min, z_min = mesh_bounds[0]
+        x_max, y_max, z_max = mesh_bounds[1]
+        body_w_m = x_max - x_min
+        body_d_m = z_max - z_min
+
+        kp_out = {}
+        for name, coord in kp_norm.items():
+            u, v = coord['u'], coord['v']
+            # v=0 at head (top of body), v=1 at feet (bottom of body)
+            mesh_y = v * target_h
+            # u=0 at left side of body bbox, u=1 at right side
+            mesh_x = x_min + u * body_w_m
+            mesh_z = 0.0  # centered; refinement via nearest vertex later
+            kp_out[name] = [float(mesh_x), float(mesh_y), float(mesh_z)]
+        return kp_out
+
+    def _run_pifuhd(self, image_bytes, bbox, img_size):
+        """Run PIFuHD and return the largest-component mesh (in its native frame)."""
+        import os, sys, tempfile, shutil, glob, io
         import trimesh
         from PIL import Image
-        import io
 
         sys.path.insert(0, "/opt/pifuhd")
         from apps.recon import reconWrapper
@@ -211,13 +194,11 @@ class BodyScanner:
         os.makedirs(out_dir, exist_ok=True)
 
         try:
-            # Save image
             img_path = os.path.join(in_dir, "person.png")
             Image.open(io.BytesIO(image_bytes)).convert("RGB").save(img_path)
 
-            # Build rect: PIFuHD format = "x1 y1 w h" (single line)
-            x1, y1, x2, y2, (W, H) = bbox_in_image
-            # Add small padding around body
+            x1, y1, x2, y2 = bbox
+            W, H = img_size
             pad_x = int((x2 - x1) * 0.10)
             pad_y = int((y2 - y1) * 0.05)
             x1 = max(0, x1 - pad_x)
@@ -226,7 +207,6 @@ class BodyScanner:
             y2 = min(H, y2 + pad_y)
             w = x2 - x1
             h = y2 - y1
-            # PIFuHD expects square crop; expand to square
             side = max(w, h)
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
@@ -235,15 +215,11 @@ class BodyScanner:
             with open(os.path.join(in_dir, "person_rect.txt"), "w") as f:
                 f.write(f"{x1} {y1} {side} {side}\n")
 
-            # Run PIFuHD reconWrapper
             cmd = [
-                "--dataroot", in_dir,
-                "--results_path", out_dir,
-                "--loadSize", "1024",
-                "--resolution", "256",
+                "--dataroot", in_dir, "--results_path", out_dir,
+                "--loadSize", "1024", "--resolution", "256",
                 "--load_netMR_checkpoint_path", "/opt/pifuhd/checkpoints/pifuhd.pt",
-                "--start_id", "-1",
-                "--end_id", "-1",
+                "--start_id", "-1", "--end_id", "-1",
             ]
             print("Running PIFuHD...")
             try:
@@ -253,175 +229,103 @@ class BodyScanner:
                 import traceback
                 traceback.print_exc()
 
-            # List everything that was created
-            created_files = []
+            obj_files = []
             for root, dirs, files in os.walk(out_dir):
                 for f in files:
-                    p = os.path.join(root, f)
-                    created_files.append(p)
-            print(f"PIFuHD produced {len(created_files)} file(s) in {out_dir}:")
-            for f in created_files[:20]:
-                print(f"  {f}")
-
-            obj_files = [f for f in created_files if f.endswith(".obj")]
+                    if f.endswith(".obj"):
+                        obj_files.append(os.path.join(root, f))
             if not obj_files:
+                print(f"No PIFuHD output in {out_dir}")
                 return None
 
             mesh = trimesh.load(obj_files[0], process=False)
-            print(f"PIFuHD raw mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+            print(f"PIFuHD raw: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
 
-            # Keep only the largest connected component (filter out floating
-            # fragments like detached hands, face pieces)
+            # Keep largest connected component
             try:
                 components = mesh.split(only_watertight=False)
                 if len(components) > 1:
                     largest = max(components, key=lambda c: len(c.vertices))
-                    print(f"Filtered {len(components)} components -> kept largest "
-                          f"({len(largest.vertices)} verts)")
+                    print(f"{len(components)} components -> kept largest ({len(largest.vertices)} verts)")
                     mesh = largest
             except Exception as e:
                 print(f"Component split failed: {e}")
 
             return mesh
-        except Exception as e:
-            print(f"PIFuHD failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
-    def _voxel_visual_hull(self, silhouettes, height_cm, voxel_size_mm=8):
-        """Voxel visual hull from 4 silhouettes via marching cubes."""
+    def _normalize_mesh(self, mesh, height_cm):
+        """Scale + translate: head at Y=0, feet at Y=height_m, centered in X/Z.
+        Also detects and flips Y if mesh is upside down.
+        """
         import numpy as np
-        from skimage.measure import marching_cubes
-        from scipy.ndimage import gaussian_filter
         import trimesh
 
-        body_h_mm = height_cm * 10.0
-        body_w_mm = body_h_mm * 0.55
-        body_d_mm = body_h_mm * 0.40
-
-        nx = max(int(body_w_mm / voxel_size_mm), 48)
-        ny = max(int(body_h_mm / voxel_size_mm), 128)
-        nz = max(int(body_d_mm / voxel_size_mm), 48)
-
-        x_coords = (np.arange(nx) + 0.5) * voxel_size_mm - body_w_mm / 2.0
-        y_coords = (np.arange(ny) + 0.5) * voxel_size_mm
-        z_coords = (np.arange(nz) + 0.5) * voxel_size_mm - body_d_mm / 2.0
-
-        voxels = np.ones((nx, ny, nz), dtype=bool)
-
-        def carve(view, sil):
-            sil_h, sil_w = sil.shape
-            row_idx = np.clip((y_coords / body_h_mm * sil_h).astype(int), 0, sil_h - 1)
-            if view in ("front", "back"):
-                x_in = x_coords + body_w_mm / 2.0 if view == "front" else -x_coords + body_w_mm / 2.0
-                col_idx = np.clip((x_in / body_w_mm * sil_w).astype(int), 0, sil_w - 1)
-                mask_xy = sil[np.ix_(row_idx, col_idx)].T
-                voxels[:] &= mask_xy[:, :, None]
-            else:
-                z_in = z_coords + body_d_mm / 2.0 if view == "left" else -z_coords + body_d_mm / 2.0
-                col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
-                mask_zy = sil[np.ix_(row_idx, col_idx)]
-                voxels[:] &= mask_zy.T[None, :, :]
-
-        for view, sil in silhouettes.items():
-            try:
-                carve(view, sil)
-            except Exception as e:
-                print(f"Carve {view} failed: {e}")
-
-        if voxels.sum() < 200:
-            return None
-
-        v_smooth = gaussian_filter(voxels.astype(np.float32), sigma=1.0)
-        v_padded = np.pad(v_smooth, 1, mode='constant', constant_values=0)
-        verts, faces, _, _ = marching_cubes(v_padded, level=0.5,
-                                            spacing=(voxel_size_mm,) * 3)
-        verts[:, 0] -= voxel_size_mm + body_w_mm / 2.0
-        verts[:, 1] -= voxel_size_mm
-        verts[:, 2] -= voxel_size_mm + body_d_mm / 2.0
-        verts /= 1000.0  # mm -> m
-
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-        try:
-            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=6)
-        except Exception:
-            pass
-        return mesh
-
-    def _normalize_mesh(self, mesh, height_cm):
-        """Translate + rescale mesh: head at Y=0, feet at Y=height_m, centered in X/Z."""
-        import numpy as np
         v = mesh.vertices.astype(np.float32)
         y_min, y_max = v[:, 1].min(), v[:, 1].max()
         h = y_max - y_min
         if h < 1e-6:
             return mesh
+
+        # Check if mesh is upside down (widest part in top half = inverted)
+        n_levels = 20
+        widths = []
+        for i in range(n_levels):
+            y0 = y_min + i * h / n_levels
+            y1 = y_min + (i + 1) * h / n_levels
+            mask = (v[:, 1] >= y0) & (v[:, 1] < y1)
+            widths.append(v[mask, 0].max() - v[mask, 0].min() if mask.sum() > 5 else 0)
+        widest = int(np.argmax(widths))
+
         target_h = height_cm / 100.0
         scale = target_h / h
         x_mean = v[:, 0].mean()
         z_mean = v[:, 2].mean()
+
         v_new = v.copy()
-        v_new[:, 1] = (v[:, 1] - y_min) * scale
+        if widest < n_levels // 2:
+            # upside down: flip Y before scaling
+            print("Mesh upside down, flipping Y")
+            v_new[:, 1] = y_max + y_min - v[:, 1]
+            v_new[:, 1] = (v_new[:, 1] - y_min) * scale
+        else:
+            v_new[:, 1] = (v[:, 1] - y_min) * scale
         v_new[:, 0] = (v[:, 0] - x_mean) * scale
         v_new[:, 2] = (v[:, 2] - z_mean) * scale
 
-        # PIFuHD output may be Y-up; detect by checking if original Y_min was at TOP of body
-        # Simpler: use heuristic - we want head at top. Check if "wider part" is at higher or lower Y.
-        # For our use, force the convention: Y=0 at top.
-        import trimesh
-        out = trimesh.Trimesh(vertices=v_new, faces=mesh.faces, process=False)
-        return out
+        return trimesh.Trimesh(vertices=v_new, faces=mesh.faces, process=False)
 
-    def _flip_mesh_if_needed(self, mesh):
-        """Detect if mesh is upside-down (head at bottom) and flip Y."""
+    def _snap_keypoints_to_mesh(self, kp, mesh):
+        """
+        For each keypoint (XYZ in mesh frame), snap Z to the nearest mesh surface
+        at that (X, Y) position so keypoints sit on the body, not floating.
+        """
         import numpy as np
         v = mesh.vertices
-        # Find the row with maximum cross-section width vs minimum
-        n_levels = 20
-        y_min, y_max = v[:, 1].min(), v[:, 1].max()
-        widths = []
-        for i in range(n_levels):
-            y0 = y_min + i * (y_max - y_min) / n_levels
-            y1 = y_min + (i + 1) * (y_max - y_min) / n_levels
-            mask = (v[:, 1] >= y0) & (v[:, 1] < y1)
-            if mask.sum() < 5:
-                widths.append(0)
-            else:
-                widths.append(v[mask, 0].max() - v[mask, 0].min())
-        widths = np.array(widths)
-        # Body widest in lower half (hips). If widest level is in upper half, mesh is upside down.
-        widest = int(widths.argmax())
-        if widest < n_levels // 2:
-            print("Mesh upside down, flipping Y")
-            v_new = v.copy()
-            v_new[:, 1] = y_max + y_min - v[:, 1]
-            import trimesh
-            return trimesh.Trimesh(vertices=v_new, faces=mesh.faces, process=False)
-        return mesh
-
-    def _align_keypoints(self, keypoints_3d, sam_vertices, height_cm):
-        import numpy as np
-        sam_y_min = sam_vertices[:, 1].min()
-        sam_y_max = sam_vertices[:, 1].max()
-        sam_h = sam_y_max - sam_y_min
-        target_h = height_cm / 100.0
-        kp_aligned = {}
-        x_mean = sam_vertices[:, 0].mean()
-        z_mean = sam_vertices[:, 2].mean()
-        for name, idx in KEYPOINTS.items():
-            if idx >= len(keypoints_3d):
+        kp_snapped = {}
+        for name, xyz in kp.items():
+            x, y, z = xyz
+            # Find vertices near this Y (within 3cm) and closest in X
+            mask = np.abs(v[:, 1] - y) < 0.03
+            if mask.sum() < 3:
+                kp_snapped[name] = xyz
                 continue
-            kp = keypoints_3d[idx]
-            new_y = (kp[1] - sam_y_min) / sam_h * target_h
-            new_x = (kp[0] - x_mean) / sam_h * target_h
-            new_z = (kp[2] - z_mean) / sam_h * target_h
-            kp_aligned[name] = [float(new_x), float(new_y), float(new_z)]
-        return kp_aligned
+            candidates = v[mask]
+            # Closest in X
+            dists_x = np.abs(candidates[:, 0] - x)
+            idx = int(np.argmin(dists_x))
+            kp_snapped[name] = [float(candidates[idx, 0]),
+                                float(candidates[idx, 1]),
+                                float(candidates[idx, 2])]
+        return kp_snapped
 
-    def _calculate_measurements_from_mesh(self, mesh, kp, height_cm):
+    def _measurements_from_mesh(self, mesh, kp, height_cm):
+        """
+        Compute body measurements via mesh slicing at anatomical Y levels from keypoints.
+        Since PIFuHD preserves the actual pose, at each slice we pick the polygon closest
+        to the body center (filters out arm polygons when they don't connect with torso).
+        """
         import trimesh, numpy as np
 
         slices_3d = {}
@@ -435,11 +339,14 @@ class BodyScanner:
             if a is None or b is None: return 0.0
             return float(np.linalg.norm(np.array(a) - np.array(b)))
 
-        ls, rs, lh, rh = gk('left_shoulder'), gk('right_shoulder'), gk('left_hip'), gk('right_hip')
+        ls, rs = gk('left_shoulder'), gk('right_shoulder')
+        lh, rh = gk('left_hip'), gk('right_hip')
         if not all([ls, rs, lh, rh]):
             return measurements, slices_3d
-        lk, rk, la, ra = gk('left_knee'), gk('right_knee'), gk('left_ankle'), gk('right_ankle')
+        lk, rk = gk('left_knee'), gk('right_knee')
+        la, ra = gk('left_ankle'), gk('right_ankle')
         le, re = gk('left_elbow'), gk('right_elbow')
+        lw, rw = gk('left_wrist'), gk('right_wrist')
 
         shoulder_y = (ls[1] + rs[1]) / 2
         hip_y = (lh[1] + rh[1]) / 2
@@ -451,82 +358,61 @@ class BodyScanner:
             try: return mesh.section(plane_origin=[0, y, 0], plane_normal=[0, 1, 0])
             except: return None
 
-        def torso_circ(y, name):
+        def circumf(y, name, selector="center"):
+            """
+            selector: "center" = polygon closest to 0,0 (torso)
+                      "off_center" = polygon farthest from 0,0 (leg/arm)
+            """
             try:
                 s = slice_at(y)
                 if s is None: return None
                 slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full: return None
-                best = min(slice_2d.polygons_full,
-                          key=lambda p: p.centroid.x**2 + p.centroid.y**2)
+                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
+                    return None
+                polys = list(slice_2d.polygons_full)
+
+                if selector == "center":
+                    best = min(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
+                    factor = 1.0
+                elif selector == "off_center":
+                    if len(polys) == 1:
+                        best = polys[0]; factor = 0.5
+                    else:
+                        best = max(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
+                        factor = 1.0
+                else:
+                    best = polys[0]; factor = 1.0
+
                 coords_2d = np.array(best.exterior.coords)
                 ones = np.ones(len(coords_2d))
                 coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
                 coords_3d = (to_3d @ coords_h.T).T[:, :3]
                 slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
-                return best.exterior.length * 100.0
+                return best.exterior.length * 100.0 * factor
             except Exception as e:
-                print(f"Slice {name}: {e}")
+                print(f"Slice {name} error: {e}")
                 return None
 
-        def leg_circ(y, name):
-            try:
-                s = slice_at(y)
-                if s is None: return None
-                slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full: return None
-                polys = list(slice_2d.polygons_full)
-                if len(polys) == 1:
-                    chosen = polys[0]; half = 0.5
-                else:
-                    sorted_polys = sorted(polys, key=lambda p: p.area, reverse=True)
-                    chosen = sorted_polys[0]
-                    for p in sorted_polys:
-                        if abs(p.centroid.x) > 0.02: chosen = p; break
-                    half = 1.0
-                coords_2d = np.array(chosen.exterior.coords)
-                ones = np.ones(len(coords_2d))
-                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
-                coords_3d = (to_3d @ coords_h.T).T[:, :3]
-                slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
-                return chosen.exterior.length * 100.0 * half
-            except: return None
-
-        def limb_circ(y, name):
-            try:
-                s = slice_at(y)
-                if s is None: return None
-                slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full: return None
-                polys = list(slice_2d.polygons_full)
-                if len(polys) == 1:
-                    chosen = polys[0]; half = 0.5
-                else:
-                    chosen = max(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2); half = 1.0
-                coords_2d = np.array(chosen.exterior.coords)
-                ones = np.ones(len(coords_2d))
-                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
-                coords_3d = (to_3d @ coords_h.T).T[:, :3]
-                slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
-                return chosen.exterior.length * 100.0 * half
-            except: return None
-
+        # Torso
         for name, frac in [("chest", 0.20), ("underbust", 0.35), ("waist", 0.55), ("hips", 1.0)]:
             y = shoulder_y + (hip_y - shoulder_y) * frac
-            c = torso_circ(y, name)
+            c = circumf(y, name, "center")
             if c: measurements[name] = round(c, 1)
 
+        # Legs (off-center polygon = single leg)
         for name, frac in [("thigh", 0.35), ("knee", 1.0)]:
             y = hip_y + (knee_y - hip_y) * frac
-            c = leg_circ(y, name)
+            c = circumf(y, name, "off_center")
             if c: measurements[name] = round(c, 1)
 
-        c = leg_circ(knee_y + (ankle_y - knee_y) * 0.30, "calf")
+        c = circumf(knee_y + (ankle_y - knee_y) * 0.30, "calf", "off_center")
         if c: measurements["calf"] = round(c, 1)
 
-        c = limb_circ(shoulder_y + (elbow_y - shoulder_y) * 0.40, "biceps")
+        # Biceps
+        c = circumf(shoulder_y + (elbow_y - shoulder_y) * 0.40, "biceps", "off_center")
         if c: measurements["biceps"] = round(c, 1)
 
+        # Shoulder width
         try:
             s = slice_at(shoulder_y + (hip_y - shoulder_y) * 0.05)
             if s is not None:
@@ -536,6 +422,7 @@ class BodyScanner:
         if "shoulder_width" not in measurements:
             measurements["shoulder_width"] = round(dist_kp('left_shoulder', 'right_shoulder') * 100.0, 1)
 
+        # Lengths
         la_l = dist_kp('left_shoulder', 'left_elbow') + dist_kp('left_elbow', 'left_wrist')
         ra_l = dist_kp('right_shoulder', 'right_elbow') + dist_kp('right_elbow', 'right_wrist')
         if la_l + ra_l > 0:
@@ -545,53 +432,46 @@ class BodyScanner:
         return measurements, slices_3d
 
     def _do_analyze(self, photos: dict, height_cm: float):
-        """
-        SAM 3D-only pipeline for consistency between mesh, keypoints and measurements.
-        SAM 3D normalizes body to T-pose which ensures:
-          - torso cross-sections are clean (arms do not pass through them)
-          - keypoints are exactly ON the visible mesh
-          - slice contours align perfectly with mesh geometry
-        """
+        """Fully non-parametric pipeline: PIFuHD + MediaPipe."""
         import numpy as np
-        import trimesh
 
-        print("Running SAM 3D...")
-        sam = self._reconstruct_keypoints(photos["front"])
-        if sam is None:
+        # 1. Silhouette + bbox of front photo
+        print("Extracting silhouette...")
+        sil, bbox, img_size = self._silhouette_and_bbox(photos["front"])
+        if bbox is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # Rescale mesh + keypoints to common frame: head at Y=0, feet at Y=height_m
-        sam_vertices = np.array(sam["vertices"])
-        sam_faces = np.array(sam["faces"])
-        sam_y_min = sam_vertices[:, 1].min()
-        sam_y_max = sam_vertices[:, 1].max()
-        sam_h = sam_y_max - sam_y_min
-        target_h = height_cm / 100.0
-        scale = target_h / sam_h if sam_h > 0 else 1.0
-        x_mean = sam_vertices[:, 0].mean()
-        z_mean = sam_vertices[:, 2].mean()
+        # 2. PIFuHD reconstruction
+        pifu_mesh = self._run_pifuhd(photos["front"], bbox, img_size)
+        if pifu_mesh is None:
+            return {"error": "Reconstruction 3D echouee"}
 
-        sam_aligned = sam_vertices.copy()
-        sam_aligned[:, 1] = (sam_vertices[:, 1] - sam_y_min) * scale
-        sam_aligned[:, 0] = (sam_vertices[:, 0] - x_mean) * scale
-        sam_aligned[:, 2] = (sam_vertices[:, 2] - z_mean) * scale
+        # 3. Normalize: head at Y=0, feet at height_m
+        pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
 
-        sam_mesh = trimesh.Trimesh(vertices=sam_aligned, faces=sam_faces, process=False)
-        kp_aligned = self._align_keypoints(sam["keypoints_3d"], sam_vertices, height_cm)
+        # 4. MediaPipe keypoints on original photo, mapped to mesh frame
+        print("Detecting keypoints (MediaPipe)...")
+        kp_norm = self._detect_pose_keypoints(photos["front"], bbox, img_size)
+        if kp_norm is None:
+            return {"error": "Keypoints non detectes"}
 
-        # Measurements from SAM3D mesh, with keypoints exactly on mesh
-        measurements, slices_3d = self._calculate_measurements_from_mesh(
-            sam_mesh, kp_aligned, height_cm
-        )
+        mesh_bounds = pifu_mesh.bounds
+        kp_on_mesh = self._map_kp_to_mesh(kp_norm, mesh_bounds, height_cm)
+
+        # Snap keypoints to mesh surface for clean visualization
+        kp_snapped = self._snap_keypoints_to_mesh(kp_on_mesh, pifu_mesh)
+
+        # 5. Measurements via slicing
+        measurements, slices_3d = self._measurements_from_mesh(pifu_mesh, kp_snapped, height_cm)
 
         return {
             "success": True,
             "measurements": measurements,
-            "vertices": sam_mesh.vertices.tolist(),
-            "faces": sam_mesh.faces.tolist(),
-            "keypoints_3d": kp_aligned,
+            "vertices": pifu_mesh.vertices.tolist(),
+            "faces": pifu_mesh.faces.tolist(),
+            "keypoints_3d": kp_snapped,
             "slices": slices_3d,
-            "viz_source": "sam3d",
+            "viz_source": "pifuhd+mediapipe",
         }
 
     @modal.method()
@@ -648,7 +528,7 @@ web_app.add_middleware(
 
 @web_app.get("/")
 async def root():
-    return {"status": "ok", "service": "ETEKA Body Scan WIX API", "pipeline": "pifuhd + visual-hull"}
+    return {"status": "ok", "pipeline": "pifuhd + mediapipe"}
 
 
 @web_app.get("/health")

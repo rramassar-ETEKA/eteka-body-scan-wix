@@ -546,31 +546,21 @@ class BodyScanner:
 
     def _do_analyze(self, photos: dict, height_cm: float):
         """
-        Pipeline:
-        - SAM 3D: keypoints + T-pose mesh for clean MEASUREMENTS (arms don't
-          interfere with torso cross-sections because SAM3D normalizes pose)
-        - PIFuHD: visual mesh for DISPLAY (handles atypical morphologies)
+        SAM 3D-only pipeline for consistency between mesh, keypoints and measurements.
+        SAM 3D normalizes body to T-pose which ensures:
+          - torso cross-sections are clean (arms do not pass through them)
+          - keypoints are exactly ON the visible mesh
+          - slice contours align perfectly with mesh geometry
         """
         import numpy as np
         import trimesh
 
-        # 1. SAM3D: keypoints AND T-pose mesh for measurements
         print("Running SAM 3D...")
         sam = self._reconstruct_keypoints(photos["front"])
         if sam is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # 2. Bbox on front for PIFuHD
-        bbox_front = self._silhouette_bbox_in_image(photos["front"])
-
-        # 3. PIFuHD on front for nice visualization
-        print("Running PIFuHD...")
-        pifu_mesh = self._run_pifuhd(photos["front"], bbox_front) if bbox_front else None
-        if pifu_mesh is not None:
-            pifu_mesh = self._flip_mesh_if_needed(pifu_mesh)
-            pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
-
-        # 4. Build SAM3D measurement mesh in same coord frame (head at 0, feet at h)
+        # Rescale mesh + keypoints to common frame: head at Y=0, feet at Y=height_m
         sam_vertices = np.array(sam["vertices"])
         sam_faces = np.array(sam["faces"])
         sam_y_min = sam_vertices[:, 1].min()
@@ -587,26 +577,21 @@ class BodyScanner:
         sam_aligned[:, 2] = (sam_vertices[:, 2] - z_mean) * scale
 
         sam_mesh = trimesh.Trimesh(vertices=sam_aligned, faces=sam_faces, process=False)
-
-        # 5. Aligned keypoints (same frame)
         kp_aligned = self._align_keypoints(sam["keypoints_3d"], sam_vertices, height_cm)
 
-        # 6. Measurements from SAM3D T-pose mesh (clean torso cross-sections)
+        # Measurements from SAM3D mesh, with keypoints exactly on mesh
         measurements, slices_3d = self._calculate_measurements_from_mesh(
             sam_mesh, kp_aligned, height_cm
         )
 
-        # Visualization mesh: prefer PIFuHD (high-quality), fallback to SAM3D
-        viz_mesh = pifu_mesh if pifu_mesh is not None else sam_mesh
-
         return {
             "success": True,
             "measurements": measurements,
-            "vertices": viz_mesh.vertices.tolist(),
-            "faces": viz_mesh.faces.tolist(),
+            "vertices": sam_mesh.vertices.tolist(),
+            "faces": sam_mesh.faces.tolist(),
             "keypoints_3d": kp_aligned,
             "slices": slices_3d,
-            "viz_source": "pifuhd" if pifu_mesh is not None else "sam3d",
+            "viz_source": "sam3d",
         }
 
     @modal.method()

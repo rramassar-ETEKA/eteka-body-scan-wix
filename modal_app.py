@@ -373,24 +373,48 @@ class BodyScanner:
         def torso_convex_hull(y, half_width_kp, tolerance=0.012):
             """
             Convex hull of torso vertices at Y level.
-            Filters to X band based on MediaPipe half_width (x 1.8 safety).
+            Uses gap detection: walks outward from X=0, stops at first gap > 1.5cm
+            (the natural gap between torso and arm skin surface).
             Returns (hull_polygon, width_x, depth_z, perimeter_m).
             """
-            # Vertices within Y tolerance
             mask_y = np.abs(mesh_verts[:, 1] - y) < tolerance
             verts = mesh_verts[mask_y]
             if len(verts) < 10:
                 return None
 
-            # Filter X band: keep vertices within 1.8x half_width_kp from center
-            x_limit = max(half_width_kp * 1.8, 0.12)  # at least 12cm
+            # Initial wide filter (safety upper bound)
+            x_limit = max(half_width_kp * 3.0, 0.25)
             mask_x = np.abs(verts[:, 0]) <= x_limit
             central = verts[mask_x]
             if len(central) < 10:
                 central = verts
 
-            # Convex hull of (X, Z) pairs
-            pts = central[:, [0, 2]]
+            # Gap detection: find the torso cluster around X=0
+            x_vals = np.sort(central[:, 0])
+            center_idx = int(np.argmin(np.abs(x_vals)))
+            x_lo = x_vals[0]
+            x_hi = x_vals[-1]
+
+            # Walk left from center, stop at first gap > 1.2cm
+            for i in range(center_idx, 0, -1):
+                if (x_vals[i] - x_vals[i - 1]) > 0.012:
+                    x_lo = x_vals[i]
+                    break
+
+            # Walk right from center, stop at first gap > 1.2cm
+            for i in range(center_idx, len(x_vals) - 1):
+                if (x_vals[i + 1] - x_vals[i]) > 0.012:
+                    x_hi = x_vals[i]
+                    break
+
+            # Filter to cluster
+            mask_cluster = (central[:, 0] >= x_lo) & (central[:, 0] <= x_hi)
+            cluster = central[mask_cluster]
+            if len(cluster) < 10:
+                cluster = central
+
+            # Convex hull of (X, Z)
+            pts = cluster[:, [0, 2]]
             try:
                 hull = MultiPoint([(p[0], p[1]) for p in pts]).convex_hull
                 if hull.geom_type != 'Polygon':
@@ -398,7 +422,7 @@ class BodyScanner:
             except Exception:
                 return None
 
-            bounds = hull.bounds  # minx, miny, maxx, maxy
+            bounds = hull.bounds
             width_x = bounds[2] - bounds[0]
             depth_z = bounds[3] - bounds[1]
             perim = hull.exterior.length
@@ -554,10 +578,11 @@ class BodyScanner:
             c = limb_circumf(knee_y + (ankle_y - knee_y) * 0.30, "calf", calf_target)
             if c: measurements["calf"] = round(c, 1)
 
-        # ----- BICEPS -----
+        # ----- BICEPS (small radius - biceps ~8cm diameter) -----
         if le and re:
             target_x_arm = ls[0] + (le[0] - ls[0]) * 0.40
-            c = limb_circumf(shoulder_y + (elbow_y - shoulder_y) * 0.40, "biceps", target_x_arm)
+            c = limb_circumf(shoulder_y + (elbow_y - shoulder_y) * 0.40,
+                             "biceps", target_x_arm, x_radius=0.05)
             if c: measurements["biceps"] = round(c, 1)
 
         # ----- Shoulder width: use mesh X extent at shoulder level -----

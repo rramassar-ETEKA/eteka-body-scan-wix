@@ -365,67 +365,92 @@ class BodyScanner:
         elbow_y = (le[1] + re[1]) / 2 if (le and re) else shoulder_y + 0.3
 
         mesh_verts = mesh.vertices
+        shoulder_halfw = abs(ls[0] - rs[0]) / 2
+        hip_halfw = abs(lh[0] - rh[0]) / 2
 
-        # --- Step 1: Scan torso cross-sections ---
-        def torso_slice_polygon(y):
+        from shapely.geometry import MultiPoint
+
+        def torso_convex_hull(y, half_width_kp, tolerance=0.012):
             """
-            Section the mesh at Y and return the torso polygon (closest to X=0)
-            + its perimeter. Excludes arm polygons (far from center).
+            Convex hull of torso vertices at Y level.
+            Filters to X band based on MediaPipe half_width (x 1.8 safety).
+            Returns (hull_polygon, width_x, depth_z, perimeter_m).
             """
+            # Vertices within Y tolerance
+            mask_y = np.abs(mesh_verts[:, 1] - y) < tolerance
+            verts = mesh_verts[mask_y]
+            if len(verts) < 10:
+                return None
+
+            # Filter X band: keep vertices within 1.8x half_width_kp from center
+            x_limit = max(half_width_kp * 1.8, 0.12)  # at least 12cm
+            mask_x = np.abs(verts[:, 0]) <= x_limit
+            central = verts[mask_x]
+            if len(central) < 10:
+                central = verts
+
+            # Convex hull of (X, Z) pairs
+            pts = central[:, [0, 2]]
             try:
-                s = mesh.section(plane_origin=[0, y, 0], plane_normal=[0, 1, 0])
-                if s is None: return None, None
-                slice_2d, to_3d = s.to_planar()
-                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
-                    return None, None
-                polys = list(slice_2d.polygons_full)
-                # Torso = polygon with centroid closest to X=0
-                torso = min(polys, key=lambda p: p.centroid.x ** 2 + p.centroid.y ** 2)
-                return torso, to_3d
+                hull = MultiPoint([(p[0], p[1]) for p in pts]).convex_hull
+                if hull.geom_type != 'Polygon':
+                    return None
             except Exception:
-                return None, None
+                return None
 
-        # Scan from above shoulders to below hips
-        y_start = shoulder_y - 0.02
-        y_end = hip_y + 0.12
-        n_scan = 60
+            bounds = hull.bounds  # minx, miny, maxx, maxy
+            width_x = bounds[2] - bounds[0]
+            depth_z = bounds[3] - bounds[1]
+            perim = hull.exterior.length
+            return hull, width_x, depth_z, perim
+
+        # --- Step 1: Scan torso widths to detect anatomical Y ---
+        y_start = shoulder_y + 0.03  # below neck, above chest
+        y_end = hip_y + 0.08  # below hip keypoint (real hip is lower)
+        n_scan = 50
         ys = np.linspace(y_start, y_end, n_scan)
         widths = np.zeros(n_scan)
+        depths = np.zeros(n_scan)
         perims = np.zeros(n_scan)
 
+        # Interpolate keypoint half-widths along Y
         for i, y in enumerate(ys):
-            poly, to_3d = torso_slice_polygon(y)
-            if poly is None:
-                continue
-            bounds = poly.bounds  # (minx, miny, maxx, maxy) in 2D slice frame
-            widths[i] = bounds[2] - bounds[0]
-            perims[i] = poly.exterior.length
+            # Interpolate kp half-width
+            alpha = (y - shoulder_y) / max(hip_y - shoulder_y, 1e-6)
+            alpha = max(0, min(1, alpha))
+            halfw = shoulder_halfw * (1 - alpha) + hip_halfw * alpha
+            result = torso_convex_hull(y, halfw)
+            if result is not None:
+                _, w, d, p = result
+                widths[i] = w; depths[i] = d; perims[i] = p
 
-        # --- Step 2: Detect anatomical Y levels from width profile ---
-        # Divide scan into regions
-        n = n_scan
-        shoulder_idx = int(np.argmin(np.abs(ys - shoulder_y)))
-        hip_idx = int(np.argmin(np.abs(ys - hip_y)))
+        # Smooth widths to avoid noise
+        from scipy.ndimage import uniform_filter1d
+        widths_smooth = uniform_filter1d(widths, size=3)
 
-        # Chest: max width in upper 40% of scan (shoulder to shoulder+0.4*(hip-shoulder))
-        chest_search_end = shoulder_idx + int((hip_idx - shoulder_idx) * 0.4)
-        chest_idx = int(shoulder_idx + np.argmax(widths[shoulder_idx:chest_search_end + 1]))
+        # --- Step 2: Detect anatomical Y levels ---
+        shoulder_idx = 0
+        hip_idx = n_scan - 1
 
-        # Hips: max width in lower region (from mid-torso to below hip)
-        hips_search_start = shoulder_idx + int((hip_idx - shoulder_idx) * 0.7)
-        hips_idx = int(hips_search_start + np.argmax(widths[hips_search_start:]))
+        # Chest: max width in upper 35% of scan
+        chest_end = int(n_scan * 0.35)
+        chest_idx = int(np.argmax(widths_smooth[:chest_end + 1]))
+
+        # Hips: max width in lower 40% of scan
+        hips_start = int(n_scan * 0.60)
+        hips_idx = int(hips_start + np.argmax(widths_smooth[hips_start:]))
 
         # Waist: min width between chest and hips
-        if hips_idx > chest_idx + 2:
-            waist_idx = int(chest_idx + 1 + np.argmin(widths[chest_idx + 1:hips_idx]))
+        if hips_idx > chest_idx + 3:
+            waist_idx = int(chest_idx + 1 + np.argmin(widths_smooth[chest_idx + 1:hips_idx]))
         else:
             waist_idx = chest_idx + (hips_idx - chest_idx) // 2
 
         # Underbust: local min between chest and waist
-        if waist_idx > chest_idx + 2:
-            underbust_idx = int(chest_idx + 1 + np.argmin(widths[chest_idx + 1:waist_idx]))
+        if waist_idx > chest_idx + 3:
+            underbust_idx = int(chest_idx + 1 + np.argmin(widths_smooth[chest_idx + 1:waist_idx]))
         else:
-            underbust_idx = chest_idx + 1
+            underbust_idx = min(chest_idx + 2, waist_idx - 1)
 
         anatomical_y = {
             'chest': ys[chest_idx],
@@ -436,32 +461,35 @@ class BodyScanner:
         print(f"Anatomical Y: chest={anatomical_y['chest']:.3f} "
               f"underbust={anatomical_y['underbust']:.3f} "
               f"waist={anatomical_y['waist']:.3f} hips={anatomical_y['hips']:.3f}")
-        print(f"Widths: chest={widths[chest_idx]*100:.1f} "
+        print(f"Widths(cm): chest={widths[chest_idx]*100:.1f} "
               f"ub={widths[underbust_idx]*100:.1f} "
               f"waist={widths[waist_idx]*100:.1f} hips={widths[hips_idx]*100:.1f}")
 
-        # ----- TORSO measurements: use REAL polygon perimeter at anatomical Y -----
-        def torso_measure(y_level, name):
-            """Measure actual polygon perimeter of torso at given Y."""
-            poly, to_3d = torso_slice_polygon(y_level)
-            if poly is None:
+        # ----- TORSO measurements: convex hull perimeter at anatomical Y -----
+        def torso_measure(y_level, name, alpha):
+            """Measure convex hull perimeter of torso at given Y."""
+            halfw = shoulder_halfw * (1 - alpha) + hip_halfw * alpha
+            result = torso_convex_hull(y_level, halfw)
+            if result is None:
                 return None
-            # Save 3D contour for visualization
+            hull, width_x, depth_z, perim = result
+            # Save 3D contour
             try:
-                coords_2d = np.array(poly.exterior.coords)
-                ones = np.ones(len(coords_2d))
-                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
-                coords_3d = (to_3d @ coords_h.T).T[:, :3]
-                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
+                coords_2d = list(hull.exterior.coords)
+                coords_3d = [[c[0], y_level, c[1]] for c in coords_2d]
+                slices_3d[name] = {"y": float(y_level), "contour": coords_3d}
             except Exception:
                 pass
-            perim = poly.exterior.length * 100.0
-            print(f"[{name}] y={y_level:.3f} polygon_perim={perim:.1f}cm")
-            return perim
+            perim_cm = perim * 100.0
+            print(f"[{name}] y={y_level:.3f} w={width_x*100:.1f}cm "
+                  f"d={depth_z*100:.1f}cm perim={perim_cm:.1f}cm")
+            return perim_cm
 
         for name in ("chest", "underbust", "waist", "hips"):
             y = anatomical_y[name]
-            c = torso_measure(y, name)
+            alpha = (y - shoulder_y) / max(hip_y - shoulder_y, 1e-6)
+            alpha = max(0, min(1, alpha))
+            c = torso_measure(y, name, alpha)
             if c: measurements[name] = round(c, 1)
 
         # ----- LIMB helpers -----
@@ -532,15 +560,19 @@ class BodyScanner:
             c = limb_circumf(shoulder_y + (elbow_y - shoulder_y) * 0.40, "biceps", target_x_arm)
             if c: measurements["biceps"] = round(c, 1)
 
-        # ----- Shoulder width -----
+        # ----- Shoulder width: use mesh X extent at shoulder level -----
         try:
-            poly, _ = torso_slice_polygon(shoulder_y)
-            if poly is not None:
-                bounds = poly.bounds
-                measurements["shoulder_width"] = round((bounds[2] - bounds[0]) * 100.0, 1)
-        except: pass
-        if "shoulder_width" not in measurements:
-            measurements["shoulder_width"] = round(dist_kp('left_shoulder', 'right_shoulder') * 100.0, 1)
+            mask = np.abs(mesh_verts[:, 1] - shoulder_y) < 0.02
+            shoulder_verts = mesh_verts[mask]
+            if len(shoulder_verts) > 10:
+                # 5-95 percentile of X to exclude outliers
+                x_min_p, x_max_p = np.percentile(shoulder_verts[:, 0], [2, 98])
+                measurements["shoulder_width"] = round((x_max_p - x_min_p) * 100.0, 1)
+        except Exception: pass
+        if "shoulder_width" not in measurements or measurements["shoulder_width"] < 25:
+            # Fallback: keypoints distance x 1.4 (keypoints are at joints, body is wider)
+            kp_dist = dist_kp('left_shoulder', 'right_shoulder')
+            measurements["shoulder_width"] = round(kp_dist * 100.0 * 1.3, 1)
 
         # ----- Lengths from keypoints -----
         la_l = dist_kp('left_shoulder', 'left_elbow') + dist_kp('left_elbow', 'left_wrist')

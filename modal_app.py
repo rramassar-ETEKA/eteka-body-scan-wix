@@ -322,13 +322,21 @@ class BodyScanner:
 
     def _measurements_from_mesh(self, mesh, kp, height_cm):
         """
-        Compute measurements via mesh slicing with POSE-AWARE polygon selection:
-        - TORSO: crop slice polygon to X range [-shoulder_half_width*1.3, same]
-          so arms are EXCLUDED even when connected to torso
-        - BICEPS / THIGH / KNEE / CALF: pick polygon closest to the
-          MediaPipe keypoint X for that limb
+        Anatomically-driven measurement pipeline:
+          1. Scan mesh cross-sections along Y from shoulders to below hips
+          2. Extract the TORSO polygon at each Y (closest to X=0, filtered)
+          3. Detect anatomical landmarks from width profile:
+               - chest = local max in upper torso
+               - underbust = local min below chest
+               - waist = global min between chest and hips
+               - hips = local max below waist (iliac crest)
+          4. Measure actual polygon perimeter at those Y levels
+
+        For limbs (biceps, thighs, etc.), use MediaPipe keypoints to locate the
+        limb and extract its polygon from the slice.
         """
         import trimesh, numpy as np
+        import math
         from shapely.geometry import box as shapely_box
 
         slices_3d = {}
@@ -349,7 +357,6 @@ class BodyScanner:
         lk, rk = gk('left_knee'), gk('right_knee')
         la, ra = gk('left_ankle'), gk('right_ankle')
         le, re = gk('left_elbow'), gk('right_elbow')
-        lw, rw = gk('left_wrist'), gk('right_wrist')
 
         shoulder_y = (ls[1] + rs[1]) / 2
         hip_y = (lh[1] + rh[1]) / 2
@@ -357,133 +364,149 @@ class BodyScanner:
         ankle_y = (la[1] + ra[1]) / 2 if (la and ra) else knee_y + 0.4
         elbow_y = (le[1] + re[1]) / 2 if (le and re) else shoulder_y + 0.3
 
-        # Body half-widths from keypoints for X-based polygon selection
-        shoulder_halfw = abs(ls[0] - rs[0]) / 2
-        hip_halfw = abs(lh[0] - rh[0]) / 2
-
-        import math
         mesh_verts = mesh.vertices
 
+        # --- Step 1: Scan torso cross-sections ---
+        def torso_slice_polygon(y):
+            """
+            Section the mesh at Y and return the torso polygon (closest to X=0)
+            + its perimeter. Excludes arm polygons (far from center).
+            """
+            try:
+                s = mesh.section(plane_origin=[0, y, 0], plane_normal=[0, 1, 0])
+                if s is None: return None, None
+                slice_2d, to_3d = s.to_planar()
+                if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
+                    return None, None
+                polys = list(slice_2d.polygons_full)
+                # Torso = polygon with centroid closest to X=0
+                torso = min(polys, key=lambda p: p.centroid.x ** 2 + p.centroid.y ** 2)
+                return torso, to_3d
+            except Exception:
+                return None, None
+
+        # Scan from above shoulders to below hips
+        y_start = shoulder_y - 0.02
+        y_end = hip_y + 0.12
+        n_scan = 60
+        ys = np.linspace(y_start, y_end, n_scan)
+        widths = np.zeros(n_scan)
+        perims = np.zeros(n_scan)
+
+        for i, y in enumerate(ys):
+            poly, to_3d = torso_slice_polygon(y)
+            if poly is None:
+                continue
+            bounds = poly.bounds  # (minx, miny, maxx, maxy) in 2D slice frame
+            widths[i] = bounds[2] - bounds[0]
+            perims[i] = poly.exterior.length
+
+        # --- Step 2: Detect anatomical Y levels from width profile ---
+        # Divide scan into regions
+        n = n_scan
+        shoulder_idx = int(np.argmin(np.abs(ys - shoulder_y)))
+        hip_idx = int(np.argmin(np.abs(ys - hip_y)))
+
+        # Chest: max width in upper 40% of scan (shoulder to shoulder+0.4*(hip-shoulder))
+        chest_search_end = shoulder_idx + int((hip_idx - shoulder_idx) * 0.4)
+        chest_idx = int(shoulder_idx + np.argmax(widths[shoulder_idx:chest_search_end + 1]))
+
+        # Hips: max width in lower region (from mid-torso to below hip)
+        hips_search_start = shoulder_idx + int((hip_idx - shoulder_idx) * 0.7)
+        hips_idx = int(hips_search_start + np.argmax(widths[hips_search_start:]))
+
+        # Waist: min width between chest and hips
+        if hips_idx > chest_idx + 2:
+            waist_idx = int(chest_idx + 1 + np.argmin(widths[chest_idx + 1:hips_idx]))
+        else:
+            waist_idx = chest_idx + (hips_idx - chest_idx) // 2
+
+        # Underbust: local min between chest and waist
+        if waist_idx > chest_idx + 2:
+            underbust_idx = int(chest_idx + 1 + np.argmin(widths[chest_idx + 1:waist_idx]))
+        else:
+            underbust_idx = chest_idx + 1
+
+        anatomical_y = {
+            'chest': ys[chest_idx],
+            'underbust': ys[underbust_idx],
+            'waist': ys[waist_idx],
+            'hips': ys[hips_idx],
+        }
+        print(f"Anatomical Y: chest={anatomical_y['chest']:.3f} "
+              f"underbust={anatomical_y['underbust']:.3f} "
+              f"waist={anatomical_y['waist']:.3f} hips={anatomical_y['hips']:.3f}")
+        print(f"Widths: chest={widths[chest_idx]*100:.1f} "
+              f"ub={widths[underbust_idx]*100:.1f} "
+              f"waist={widths[waist_idx]*100:.1f} hips={widths[hips_idx]*100:.1f}")
+
+        # ----- TORSO measurements: use REAL polygon perimeter at anatomical Y -----
+        def torso_measure(y_level, name):
+            """Measure actual polygon perimeter of torso at given Y."""
+            poly, to_3d = torso_slice_polygon(y_level)
+            if poly is None:
+                return None
+            # Save 3D contour for visualization
+            try:
+                coords_2d = np.array(poly.exterior.coords)
+                ones = np.ones(len(coords_2d))
+                coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
+                coords_3d = (to_3d @ coords_h.T).T[:, :3]
+                slices_3d[name] = {"y": float(y_level), "contour": coords_3d.tolist()}
+            except Exception:
+                pass
+            perim = poly.exterior.length * 100.0
+            print(f"[{name}] y={y_level:.3f} polygon_perim={perim:.1f}cm")
+            return perim
+
+        for name in ("chest", "underbust", "waist", "hips"):
+            y = anatomical_y[name]
+            c = torso_measure(y, name)
+            if c: measurements[name] = round(c, 1)
+
+        # ----- LIMB helpers -----
         def slice_vertices(y, tolerance=0.015):
-            """Get mesh vertices close to Y level (within tolerance meters)."""
             mask = np.abs(mesh_verts[:, 1] - y) < tolerance
             return mesh_verts[mask]
 
         def ellipse_perimeter(a, b):
-            """Ramanujan approximation for ellipse perimeter (meters)."""
-            if a + b < 1e-6:
-                return 0.0
+            if a + b < 1e-6: return 0.0
             h = ((a - b) / (a + b)) ** 2
             return math.pi * (a + b) * (1 + 3 * h / (10 + math.sqrt(4 - 3 * h)))
 
         def build_ellipse_contour(y, a, b, cx=0.0, cz=0.0, n=48):
-            """3D contour points for an ellipse at Y level with semi-axes (a, b)."""
             coords = []
             for i in range(n + 1):
                 theta = 2 * math.pi * i / n
                 coords.append([cx + a * math.cos(theta), y, cz + b * math.sin(theta)])
             return coords
 
-        def torso_circumf(y, name, half_width, multiplier):
-            """
-            Torso ellipse from mesh vertices near Y.
-            Uses a contiguous-cluster approach around X=0 to exclude arms:
-              1. Bin vertices in X direction
-              2. Grow cluster outward from X=0 while bins are non-empty
-              3. Stop at first gap > 2cm (arm disconnected from torso)
-            Uses MediaPipe keypoint half_width * multiplier as hard upper bound.
-            """
-            verts = slice_vertices(y)
-            if len(verts) < 10:
-                return None
-
-            x_max_abs = half_width * multiplier
-            mask = np.abs(verts[:, 0]) <= x_max_abs
-            central = verts[mask]
-            if len(central) < 10:
-                central = verts
-
-            # Find connected cluster around X=0 via histogram gap detection
-            x_sorted = np.sort(central[:, 0])
-            # Find biggest gaps on each side of 0
-            left = x_sorted[x_sorted <= 0]
-            right = x_sorted[x_sorted > 0]
-            x_lo, x_hi = x_sorted.min(), x_sorted.max()
-            if len(left) > 1:
-                left_diffs = np.diff(left)
-                # Walk from 0 leftward, stop at first gap >2cm
-                for i in range(len(left) - 1, 0, -1):
-                    if -left[i - 1] > 0 and (left[i] - left[i - 1]) > 0.02:
-                        x_lo = left[i]
-                        break
-            if len(right) > 1:
-                for i in range(len(right) - 1):
-                    if (right[i + 1] - right[i]) > 0.02:
-                        x_hi = right[i]
-                        break
-
-            # Filter to cluster range
-            mask = (central[:, 0] >= x_lo) & (central[:, 0] <= x_hi)
-            cluster = central[mask]
-            if len(cluster) < 10:
-                cluster = central
-
-            # Use 5-95 percentile to avoid mesh noise
-            x_min_p, x_max_p = np.percentile(cluster[:, 0], [5, 95])
-            z_min_p, z_max_p = np.percentile(cluster[:, 2], [5, 95])
-            a = (x_max_p - x_min_p) / 2
-            b = (z_max_p - z_min_p) / 2
-            if a < 0.02 or b < 0.02:
-                return None
-            cx = (x_max_p + x_min_p) / 2
-            cz = (z_max_p + z_min_p) / 2
-            slices_3d[name] = {"y": float(y),
-                               "contour": build_ellipse_contour(y, a, b, cx, cz)}
-            print(f"[{name}] y={y:.3f} kp_halfw={half_width:.3f} mult={multiplier} "
-                  f"cluster=[{x_lo:.3f},{x_hi:.3f}] a={a:.3f} b={b:.3f} "
-                  f"perim={ellipse_perimeter(a, b)*100:.1f}cm")
-            return ellipse_perimeter(a, b) * 100.0
-
         def limb_circumf(y, name, target_x, x_radius=0.08):
-            """
-            Limb ellipse from mesh vertices near Y, around target_x.
-            Uses cluster detection to isolate the limb from nearby torso/arm.
-            """
+            """Limb ellipse using cluster detection around target_x."""
             verts = slice_vertices(y)
-            if len(verts) < 10:
-                return None
-            # Initial filter around target_x
+            if len(verts) < 10: return None
             mask = np.abs(verts[:, 0] - target_x) <= x_radius
             lv = verts[mask]
-            if len(lv) < 5:
-                return None
-
-            # Cluster detection: keep only contiguous vertices around target_x
+            if len(lv) < 5: return None
+            # Cluster detection
             x_sorted = np.sort(lv[:, 0])
-            # Find gaps, keep cluster containing target_x
             gaps = np.where(np.diff(x_sorted) > 0.015)[0]
             if len(gaps) > 0:
-                # Walk from target_x outward, stop at first gap
                 idx_target = np.argmin(np.abs(x_sorted - target_x))
-                x_lo = x_sorted[0]
-                x_hi = x_sorted[-1]
+                x_lo = x_sorted[0]; x_hi = x_sorted[-1]
                 for g in gaps:
                     if g < idx_target:
                         x_lo = x_sorted[g + 1]
                     elif g >= idx_target:
-                        x_hi = x_sorted[g]
-                        break
+                        x_hi = x_sorted[g]; break
                 m2 = (lv[:, 0] >= x_lo) & (lv[:, 0] <= x_hi)
                 if m2.sum() >= 5:
                     lv = lv[m2]
-
-            # Percentile-based dimensions
             x_min_p, x_max_p = np.percentile(lv[:, 0], [5, 95])
             z_min_p, z_max_p = np.percentile(lv[:, 2], [5, 95])
             a = (x_max_p - x_min_p) / 2
             b = (z_max_p - z_min_p) / 2
-            if a < 0.01 or b < 0.01:
-                return None
+            if a < 0.01 or b < 0.01: return None
             cx = (x_max_p + x_min_p) / 2
             cz = (z_max_p + z_min_p) / 2
             slices_3d[name] = {"y": float(y),
@@ -492,57 +515,29 @@ class BodyScanner:
                   f"perim={ellipse_perimeter(a, b)*100:.1f}cm")
             return ellipse_perimeter(a, b) * 100.0
 
-        # ----- TORSO measurements (cluster around X=0) -----
-        # Multipliers reflect that MediaPipe keypoints are at body joints (inner),
-        # while the actual body silhouette extends further out:
-        #   - shoulder keypoints ~= shoulder joint, real shoulder is wider
-        #   - hip keypoints ~= hip joint, real hip (iliac crest) is much wider
-        torso_levels = [
-            ("chest", 0.20, 1.6),       # chest close to shoulders
-            ("underbust", 0.35, 1.6),
-            ("waist", 0.55, 1.8),        # waist can be narrower than shoulder keypoint
-            ("hips", 1.0, 2.5),          # hip keypoints are very inner
-        ]
-        for name, frac, multiplier in torso_levels:
-            y = shoulder_y + (hip_y - shoulder_y) * frac
-            half_w = shoulder_halfw + (hip_halfw - shoulder_halfw) * frac
-            c = torso_circumf(y, name, half_w, multiplier)
-            if c: measurements[name] = round(c, 1)
-
-        # ----- LEG measurements (single leg via MediaPipe knee X) -----
+        # ----- LEG measurements -----
         if lk and rk:
-            # Mid-thigh: between hip and knee
-            y_thigh = hip_y + (knee_y - hip_y) * 0.35
-            # Target X: halfway between hip and knee (average of left + right leg positions)
-            leg_x = (lk[0] + rk[0]) / 2  # zero for most people
-            # Actually we want ONE leg, not center. Use one side.
-            # Use left knee X as target (arbitrary - body symmetric)
             target_x_leg = lk[0]
-            c = limb_circumf(y_thigh, "thigh", target_x_leg)
+            c = limb_circumf(hip_y + (knee_y - hip_y) * 0.35, "thigh", target_x_leg)
             if c: measurements["thigh"] = round(c, 1)
-
             c = limb_circumf(knee_y, "knee", target_x_leg)
             if c: measurements["knee"] = round(c, 1)
-
-            y_calf = knee_y + (ankle_y - knee_y) * 0.30
             calf_target = la[0] if la else target_x_leg
-            c = limb_circumf(y_calf, "calf", calf_target)
+            c = limb_circumf(knee_y + (ankle_y - knee_y) * 0.30, "calf", calf_target)
             if c: measurements["calf"] = round(c, 1)
 
-        # ----- BICEPS (single arm via MediaPipe elbow X) -----
+        # ----- BICEPS -----
         if le and re:
-            y_bic = shoulder_y + (elbow_y - shoulder_y) * 0.40
-            # Interpolate X between shoulder and elbow for the left arm
             target_x_arm = ls[0] + (le[0] - ls[0]) * 0.40
-            c = limb_circumf(y_bic, "biceps", target_x_arm)
+            c = limb_circumf(shoulder_y + (elbow_y - shoulder_y) * 0.40, "biceps", target_x_arm)
             if c: measurements["biceps"] = round(c, 1)
 
-        # ----- Shoulder width (mesh X extent at shoulder) -----
+        # ----- Shoulder width -----
         try:
-            s = slice_at(shoulder_y + (hip_y - shoulder_y) * 0.05)
-            if s is not None:
-                v_s = np.array(s.vertices)
-                measurements["shoulder_width"] = round((v_s[:, 0].max() - v_s[:, 0].min()) * 100.0, 1)
+            poly, _ = torso_slice_polygon(shoulder_y)
+            if poly is not None:
+                bounds = poly.bounds
+                measurements["shoulder_width"] = round((bounds[2] - bounds[0]) * 100.0, 1)
         except: pass
         if "shoulder_width" not in measurements:
             measurements["shoulder_width"] = round(dist_kp('left_shoulder', 'right_shoulder') * 100.0, 1)

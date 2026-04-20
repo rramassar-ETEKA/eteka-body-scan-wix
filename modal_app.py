@@ -384,50 +384,74 @@ class BodyScanner:
             slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
             return coords_3d
 
-        def torso_circumf(y, name, half_width):
-            """Crop polygon to central X band so arms are excluded."""
-            polys, to_3d = get_polygons(y)
-            if not polys: return None
-            # Pick polygon closest to center
-            central = min(polys, key=lambda p: p.centroid.x**2 + p.centroid.y**2)
-            # Crop to torso X range (1.4x shoulder/hip half-width for safety)
-            clip = shapely_box(-half_width * 1.4, -10.0, half_width * 1.4, 10.0)
-            try:
-                cropped = central.intersection(clip)
-                if hasattr(cropped, 'geoms'):
-                    cropped = max(cropped.geoms, key=lambda p: p.area)
-                if cropped.is_empty or cropped.area < 1e-4:
-                    cropped = central  # fallback if crop removes everything
-            except Exception:
-                cropped = central
-            poly_to_3d(cropped, to_3d, name, y)
-            return cropped.exterior.length * 100.0
+        import math
+        mesh_verts = mesh.vertices
 
-        def limb_circumf(y, name, target_x):
-            """Pick polygon closest to target_x (limb position from keypoints)."""
-            polys, to_3d = get_polygons(y)
-            if not polys: return None
-            # Pick polygon closest to target_x
-            best = min(polys, key=lambda p: (p.centroid.x - target_x) ** 2)
-            # Safety: if polygon is too wide (>25cm), it's not a limb - skip
-            bounds = best.bounds  # minx, miny, maxx, maxy
-            width_m = bounds[2] - bounds[0]
-            if width_m > 0.25:
-                # Polygon is body+limb merged. Try to crop to limb side.
-                if target_x > 0:
-                    clip = shapely_box(0.02, -10.0, 10.0, 10.0)
-                else:
-                    clip = shapely_box(-10.0, -10.0, -0.02, 10.0)
-                try:
-                    cropped = best.intersection(clip)
-                    if hasattr(cropped, 'geoms'):
-                        cropped = max(cropped.geoms, key=lambda p: p.area)
-                    if not cropped.is_empty and cropped.area > 1e-4:
-                        best = cropped
-                except Exception:
-                    pass
-            poly_to_3d(best, to_3d, name, y)
-            return best.exterior.length * 100.0
+        def slice_vertices(y, tolerance=0.015):
+            """Get mesh vertices close to Y level (within tolerance meters)."""
+            mask = np.abs(mesh_verts[:, 1] - y) < tolerance
+            return mesh_verts[mask]
+
+        def ellipse_perimeter(a, b):
+            """Ramanujan approximation for ellipse perimeter (meters)."""
+            if a + b < 1e-6:
+                return 0.0
+            h = ((a - b) / (a + b)) ** 2
+            return math.pi * (a + b) * (1 + 3 * h / (10 + math.sqrt(4 - 3 * h)))
+
+        def build_ellipse_contour(y, a, b, cx=0.0, cz=0.0, n=48):
+            """3D contour points for an ellipse at Y level with semi-axes (a, b)."""
+            coords = []
+            for i in range(n + 1):
+                theta = 2 * math.pi * i / n
+                coords.append([cx + a * math.cos(theta), y, cz + b * math.sin(theta)])
+            return coords
+
+        def torso_circumf(y, name, half_width):
+            """
+            Torso ellipse from mesh vertices near Y, filtered to central X band.
+            Width = X range of filtered vertices. Depth = Z range.
+            """
+            verts = slice_vertices(y)
+            if len(verts) < 10:
+                return None
+            # Filter to central X band (exclude arms)
+            x_limit = half_width * 1.5
+            mask = np.abs(verts[:, 0]) <= x_limit
+            central = verts[mask]
+            if len(central) < 10:
+                central = verts  # fallback
+            a = (central[:, 0].max() - central[:, 0].min()) / 2
+            b = (central[:, 2].max() - central[:, 2].min()) / 2
+            if a < 0.02 or b < 0.02:
+                return None
+            cx = (central[:, 0].max() + central[:, 0].min()) / 2
+            cz = (central[:, 2].max() + central[:, 2].min()) / 2
+            slices_3d[name] = {"y": float(y),
+                               "contour": build_ellipse_contour(y, a, b, cx, cz)}
+            return ellipse_perimeter(a, b) * 100.0
+
+        def limb_circumf(y, name, target_x, x_radius=0.10):
+            """
+            Limb ellipse from mesh vertices near Y, filtered to X range around target_x.
+            x_radius = 10cm default (biceps, thighs fit within 20cm X window).
+            """
+            verts = slice_vertices(y)
+            if len(verts) < 10:
+                return None
+            mask = np.abs(verts[:, 0] - target_x) <= x_radius
+            lv = verts[mask]
+            if len(lv) < 5:
+                return None
+            a = (lv[:, 0].max() - lv[:, 0].min()) / 2
+            b = (lv[:, 2].max() - lv[:, 2].min()) / 2
+            if a < 0.01 or b < 0.01:
+                return None
+            cx = (lv[:, 0].max() + lv[:, 0].min()) / 2
+            cz = (lv[:, 2].max() + lv[:, 2].min()) / 2
+            slices_3d[name] = {"y": float(y),
+                               "contour": build_ellipse_contour(y, a, b, cx, cz)}
+            return ellipse_perimeter(a, b) * 100.0
 
         # ----- TORSO measurements (cropped to central X band) -----
         for name, frac in [("chest", 0.20), ("underbust", 0.35), ("waist", 0.55)]:

@@ -372,48 +372,47 @@ class BodyScanner:
 
         def torso_convex_hull(y, half_width_kp, tolerance=0.012):
             """
-            Convex hull of torso vertices at Y level.
-            Uses gap detection: walks outward from X=0, stops at first gap > 1.5cm
-            (the natural gap between torso and arm skin surface).
-            Returns (hull_polygon, width_x, depth_z, perimeter_m).
+            Convex hull of torso vertices at Y level with gap detection.
+            Returns (hull, width_x, depth_z, perimeter_m, gap_found).
+            gap_found is False if torso is still attached to arms at this Y
+            (armpit zone) - such Y levels should be excluded from chest detection.
             """
             mask_y = np.abs(mesh_verts[:, 1] - y) < tolerance
             verts = mesh_verts[mask_y]
             if len(verts) < 10:
                 return None
 
-            # Initial wide filter (safety upper bound)
             x_limit = max(half_width_kp * 3.0, 0.25)
             mask_x = np.abs(verts[:, 0]) <= x_limit
             central = verts[mask_x]
             if len(central) < 10:
                 central = verts
 
-            # Gap detection: find the torso cluster around X=0
             x_vals = np.sort(central[:, 0])
             center_idx = int(np.argmin(np.abs(x_vals)))
             x_lo = x_vals[0]
             x_hi = x_vals[-1]
+            gap_left = False
+            gap_right = False
 
-            # Walk left from center, stop at first gap > 1.2cm
             for i in range(center_idx, 0, -1):
                 if (x_vals[i] - x_vals[i - 1]) > 0.012:
                     x_lo = x_vals[i]
+                    gap_left = True
                     break
-
-            # Walk right from center, stop at first gap > 1.2cm
             for i in range(center_idx, len(x_vals) - 1):
                 if (x_vals[i + 1] - x_vals[i]) > 0.012:
                     x_hi = x_vals[i]
+                    gap_right = True
                     break
 
-            # Filter to cluster
+            gap_found = gap_left and gap_right
+
             mask_cluster = (central[:, 0] >= x_lo) & (central[:, 0] <= x_hi)
             cluster = central[mask_cluster]
             if len(cluster) < 10:
                 cluster = central
 
-            # Convex hull of (X, Z)
             pts = cluster[:, [0, 2]]
             try:
                 hull = MultiPoint([(p[0], p[1]) for p in pts]).convex_hull
@@ -426,7 +425,7 @@ class BodyScanner:
             width_x = bounds[2] - bounds[0]
             depth_z = bounds[3] - bounds[1]
             perim = hull.exterior.length
-            return hull, width_x, depth_z, perim
+            return hull, width_x, depth_z, perim, gap_found
 
         # --- Step 1: Scan torso widths to detect anatomical Y ---
         y_start = shoulder_y + 0.03  # below neck, above chest
@@ -437,42 +436,60 @@ class BodyScanner:
         depths = np.zeros(n_scan)
         perims = np.zeros(n_scan)
 
-        # Interpolate keypoint half-widths along Y
+        gap_valid = np.zeros(n_scan, dtype=bool)
         for i, y in enumerate(ys):
-            # Interpolate kp half-width
             alpha = (y - shoulder_y) / max(hip_y - shoulder_y, 1e-6)
             alpha = max(0, min(1, alpha))
             halfw = shoulder_halfw * (1 - alpha) + hip_halfw * alpha
             result = torso_convex_hull(y, halfw)
             if result is not None:
-                _, w, d, p = result
+                _, w, d, p, gap = result
                 widths[i] = w; depths[i] = d; perims[i] = p
+                gap_valid[i] = gap
 
-        # Smooth widths to avoid noise
         from scipy.ndimage import uniform_filter1d
         widths_smooth = uniform_filter1d(widths, size=3)
 
         # --- Step 2: Detect anatomical Y levels ---
-        shoulder_idx = 0
-        hip_idx = n_scan - 1
+        # Only consider Y levels where gap was detected (arms separated from torso)
+        # For chest, skip the upper armpit zone (first 15% of scan)
+        chest_start = int(n_scan * 0.15)
+        chest_end = int(n_scan * 0.40)
 
-        # Chest: max width in upper 35% of scan
-        chest_end = int(n_scan * 0.35)
-        chest_idx = int(np.argmax(widths_smooth[:chest_end + 1]))
+        # Mask: valid widths where gap is found, else 0
+        valid_widths = np.where(gap_valid, widths_smooth, 0)
 
-        # Hips: max width in lower 40% of scan
-        hips_start = int(n_scan * 0.60)
+        # Chest: max VALID width in 15-40% of scan
+        chest_range = valid_widths[chest_start:chest_end + 1]
+        if chest_range.max() > 0:
+            chest_idx = int(chest_start + np.argmax(chest_range))
+        else:
+            # No gap found - chest is near shoulders but arms attached
+            chest_idx = int(n_scan * 0.20)
+
+        # Hips: max width in lower 35% of scan
+        hips_start = int(n_scan * 0.65)
         hips_idx = int(hips_start + np.argmax(widths_smooth[hips_start:]))
 
-        # Waist: min width between chest and hips
+        # Waist: min width between chest and hips (valid only)
         if hips_idx > chest_idx + 3:
-            waist_idx = int(chest_idx + 1 + np.argmin(widths_smooth[chest_idx + 1:hips_idx]))
+            waist_range = np.where(
+                gap_valid[chest_idx + 1:hips_idx],
+                widths_smooth[chest_idx + 1:hips_idx],
+                1e9,
+            )
+            waist_idx = int(chest_idx + 1 + np.argmin(waist_range))
         else:
             waist_idx = chest_idx + (hips_idx - chest_idx) // 2
 
         # Underbust: local min between chest and waist
         if waist_idx > chest_idx + 3:
-            underbust_idx = int(chest_idx + 1 + np.argmin(widths_smooth[chest_idx + 1:waist_idx]))
+            ub_range = np.where(
+                gap_valid[chest_idx + 1:waist_idx],
+                widths_smooth[chest_idx + 1:waist_idx],
+                1e9,
+            )
+            underbust_idx = int(chest_idx + 1 + np.argmin(ub_range))
         else:
             underbust_idx = min(chest_idx + 2, waist_idx - 1)
 
@@ -496,7 +513,7 @@ class BodyScanner:
             result = torso_convex_hull(y_level, halfw)
             if result is None:
                 return None
-            hull, width_x, depth_z, perim = result
+            hull, width_x, depth_z, perim, _ = result
             # Save 3D contour
             try:
                 coords_2d = list(hull.exterior.coords)

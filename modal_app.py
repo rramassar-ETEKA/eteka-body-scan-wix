@@ -384,31 +384,53 @@ class BodyScanner:
                 coords.append([cx + a * math.cos(theta), y, cz + b * math.sin(theta)])
             return coords
 
-        def torso_circumf(y, name, half_width):
+        def torso_circumf(y, name, half_width, multiplier):
             """
             Torso ellipse from mesh vertices near Y.
-            Strategy:
-              1. Keep only vertices within ±half_width * 1.1 from center X
-              2. Use 5-95 percentile of X and Z to avoid outlier vertices
-              3. Compute ellipse via Ramanujan on semi-axes
+            Uses a contiguous-cluster approach around X=0 to exclude arms:
+              1. Bin vertices in X direction
+              2. Grow cluster outward from X=0 while bins are non-empty
+              3. Stop at first gap > 2cm (arm disconnected from torso)
+            Uses MediaPipe keypoint half_width * multiplier as hard upper bound.
             """
             verts = slice_vertices(y)
             if len(verts) < 10:
                 return None
-            # Tight filter: torso is ~same width as shoulders/hips
-            x_limit = half_width * 1.1
-            mask = np.abs(verts[:, 0]) <= x_limit
+
+            x_max_abs = half_width * multiplier
+            mask = np.abs(verts[:, 0]) <= x_max_abs
             central = verts[mask]
             if len(central) < 10:
-                # Fallback: use percentile-based filter
-                x_p20, x_p80 = np.percentile(verts[:, 0], [20, 80])
-                mask = (verts[:, 0] >= x_p20) & (verts[:, 0] <= x_p80)
-                central = verts[mask]
-                if len(central) < 5:
-                    return None
-            # Use 5-95 percentile to avoid outliers (mesh noise)
-            x_min_p, x_max_p = np.percentile(central[:, 0], [5, 95])
-            z_min_p, z_max_p = np.percentile(central[:, 2], [5, 95])
+                central = verts
+
+            # Find connected cluster around X=0 via histogram gap detection
+            x_sorted = np.sort(central[:, 0])
+            # Find biggest gaps on each side of 0
+            left = x_sorted[x_sorted <= 0]
+            right = x_sorted[x_sorted > 0]
+            x_lo, x_hi = x_sorted.min(), x_sorted.max()
+            if len(left) > 1:
+                left_diffs = np.diff(left)
+                # Walk from 0 leftward, stop at first gap >2cm
+                for i in range(len(left) - 1, 0, -1):
+                    if -left[i - 1] > 0 and (left[i] - left[i - 1]) > 0.02:
+                        x_lo = left[i]
+                        break
+            if len(right) > 1:
+                for i in range(len(right) - 1):
+                    if (right[i + 1] - right[i]) > 0.02:
+                        x_hi = right[i]
+                        break
+
+            # Filter to cluster range
+            mask = (central[:, 0] >= x_lo) & (central[:, 0] <= x_hi)
+            cluster = central[mask]
+            if len(cluster) < 10:
+                cluster = central
+
+            # Use 5-95 percentile to avoid mesh noise
+            x_min_p, x_max_p = np.percentile(cluster[:, 0], [5, 95])
+            z_min_p, z_max_p = np.percentile(cluster[:, 2], [5, 95])
             a = (x_max_p - x_min_p) / 2
             b = (z_max_p - z_min_p) / 2
             if a < 0.02 or b < 0.02:
@@ -417,42 +439,75 @@ class BodyScanner:
             cz = (z_max_p + z_min_p) / 2
             slices_3d[name] = {"y": float(y),
                                "contour": build_ellipse_contour(y, a, b, cx, cz)}
-            print(f"[{name}] y={y:.3f} half_w_kp={half_width:.3f} "
-                  f"a={a:.3f} b={b:.3f} perim={ellipse_perimeter(a, b)*100:.1f}cm")
+            print(f"[{name}] y={y:.3f} kp_halfw={half_width:.3f} mult={multiplier} "
+                  f"cluster=[{x_lo:.3f},{x_hi:.3f}] a={a:.3f} b={b:.3f} "
+                  f"perim={ellipse_perimeter(a, b)*100:.1f}cm")
             return ellipse_perimeter(a, b) * 100.0
 
-        def limb_circumf(y, name, target_x, x_radius=0.10):
+        def limb_circumf(y, name, target_x, x_radius=0.08):
             """
-            Limb ellipse from mesh vertices near Y, filtered to X range around target_x.
-            x_radius = 10cm default (biceps, thighs fit within 20cm X window).
+            Limb ellipse from mesh vertices near Y, around target_x.
+            Uses cluster detection to isolate the limb from nearby torso/arm.
             """
             verts = slice_vertices(y)
             if len(verts) < 10:
                 return None
+            # Initial filter around target_x
             mask = np.abs(verts[:, 0] - target_x) <= x_radius
             lv = verts[mask]
             if len(lv) < 5:
                 return None
-            a = (lv[:, 0].max() - lv[:, 0].min()) / 2
-            b = (lv[:, 2].max() - lv[:, 2].min()) / 2
+
+            # Cluster detection: keep only contiguous vertices around target_x
+            x_sorted = np.sort(lv[:, 0])
+            # Find gaps, keep cluster containing target_x
+            gaps = np.where(np.diff(x_sorted) > 0.015)[0]
+            if len(gaps) > 0:
+                # Walk from target_x outward, stop at first gap
+                idx_target = np.argmin(np.abs(x_sorted - target_x))
+                x_lo = x_sorted[0]
+                x_hi = x_sorted[-1]
+                for g in gaps:
+                    if g < idx_target:
+                        x_lo = x_sorted[g + 1]
+                    elif g >= idx_target:
+                        x_hi = x_sorted[g]
+                        break
+                m2 = (lv[:, 0] >= x_lo) & (lv[:, 0] <= x_hi)
+                if m2.sum() >= 5:
+                    lv = lv[m2]
+
+            # Percentile-based dimensions
+            x_min_p, x_max_p = np.percentile(lv[:, 0], [5, 95])
+            z_min_p, z_max_p = np.percentile(lv[:, 2], [5, 95])
+            a = (x_max_p - x_min_p) / 2
+            b = (z_max_p - z_min_p) / 2
             if a < 0.01 or b < 0.01:
                 return None
-            cx = (lv[:, 0].max() + lv[:, 0].min()) / 2
-            cz = (lv[:, 2].max() + lv[:, 2].min()) / 2
+            cx = (x_max_p + x_min_p) / 2
+            cz = (z_max_p + z_min_p) / 2
             slices_3d[name] = {"y": float(y),
                                "contour": build_ellipse_contour(y, a, b, cx, cz)}
+            print(f"[{name}] y={y:.3f} target_x={target_x:.3f} a={a:.3f} b={b:.3f} "
+                  f"perim={ellipse_perimeter(a, b)*100:.1f}cm")
             return ellipse_perimeter(a, b) * 100.0
 
-        # ----- TORSO measurements (cropped to central X band) -----
-        for name, frac in [("chest", 0.20), ("underbust", 0.35), ("waist", 0.55)]:
+        # ----- TORSO measurements (cluster around X=0) -----
+        # Multipliers reflect that MediaPipe keypoints are at body joints (inner),
+        # while the actual body silhouette extends further out:
+        #   - shoulder keypoints ~= shoulder joint, real shoulder is wider
+        #   - hip keypoints ~= hip joint, real hip (iliac crest) is much wider
+        torso_levels = [
+            ("chest", 0.20, 1.6),       # chest close to shoulders
+            ("underbust", 0.35, 1.6),
+            ("waist", 0.55, 1.8),        # waist can be narrower than shoulder keypoint
+            ("hips", 1.0, 2.5),          # hip keypoints are very inner
+        ]
+        for name, frac, multiplier in torso_levels:
             y = shoulder_y + (hip_y - shoulder_y) * frac
-            # Interpolate half-width between shoulder and hip
             half_w = shoulder_halfw + (hip_halfw - shoulder_halfw) * frac
-            c = torso_circumf(y, name, half_w)
+            c = torso_circumf(y, name, half_w, multiplier)
             if c: measurements[name] = round(c, 1)
-
-        c = torso_circumf(hip_y, "hips", hip_halfw)
-        if c: measurements["hips"] = round(c, 1)
 
         # ----- LEG measurements (single leg via MediaPipe knee X) -----
         if lk and rk:

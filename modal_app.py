@@ -361,29 +361,6 @@ class BodyScanner:
         shoulder_halfw = abs(ls[0] - rs[0]) / 2
         hip_halfw = abs(lh[0] - rh[0]) / 2
 
-        def slice_at(y):
-            try: return mesh.section(plane_origin=[0, y, 0], plane_normal=[0, 1, 0])
-            except: return None
-
-        def get_polygons(y):
-            s = slice_at(y)
-            if s is None: return None, None
-            try:
-                slice_2d, to_3d = s.to_planar()
-            except:
-                return None, None
-            if not hasattr(slice_2d, 'polygons_full') or not slice_2d.polygons_full:
-                return None, None
-            return list(slice_2d.polygons_full), to_3d
-
-        def poly_to_3d(poly, to_3d, name, y):
-            coords_2d = np.array(poly.exterior.coords)
-            ones = np.ones(len(coords_2d))
-            coords_h = np.column_stack([coords_2d, np.zeros(len(coords_2d)), ones])
-            coords_3d = (to_3d @ coords_h.T).T[:, :3]
-            slices_3d[name] = {"y": float(y), "contour": coords_3d.tolist()}
-            return coords_3d
-
         import math
         mesh_verts = mesh.vertices
 
@@ -409,26 +386,39 @@ class BodyScanner:
 
         def torso_circumf(y, name, half_width):
             """
-            Torso ellipse from mesh vertices near Y, filtered to central X band.
-            Width = X range of filtered vertices. Depth = Z range.
+            Torso ellipse from mesh vertices near Y.
+            Strategy:
+              1. Keep only vertices within ±half_width * 1.1 from center X
+              2. Use 5-95 percentile of X and Z to avoid outlier vertices
+              3. Compute ellipse via Ramanujan on semi-axes
             """
             verts = slice_vertices(y)
             if len(verts) < 10:
                 return None
-            # Filter to central X band (exclude arms)
-            x_limit = half_width * 1.5
+            # Tight filter: torso is ~same width as shoulders/hips
+            x_limit = half_width * 1.1
             mask = np.abs(verts[:, 0]) <= x_limit
             central = verts[mask]
             if len(central) < 10:
-                central = verts  # fallback
-            a = (central[:, 0].max() - central[:, 0].min()) / 2
-            b = (central[:, 2].max() - central[:, 2].min()) / 2
+                # Fallback: use percentile-based filter
+                x_p20, x_p80 = np.percentile(verts[:, 0], [20, 80])
+                mask = (verts[:, 0] >= x_p20) & (verts[:, 0] <= x_p80)
+                central = verts[mask]
+                if len(central) < 5:
+                    return None
+            # Use 5-95 percentile to avoid outliers (mesh noise)
+            x_min_p, x_max_p = np.percentile(central[:, 0], [5, 95])
+            z_min_p, z_max_p = np.percentile(central[:, 2], [5, 95])
+            a = (x_max_p - x_min_p) / 2
+            b = (z_max_p - z_min_p) / 2
             if a < 0.02 or b < 0.02:
                 return None
-            cx = (central[:, 0].max() + central[:, 0].min()) / 2
-            cz = (central[:, 2].max() + central[:, 2].min()) / 2
+            cx = (x_max_p + x_min_p) / 2
+            cz = (z_max_p + z_min_p) / 2
             slices_3d[name] = {"y": float(y),
                                "contour": build_ellipse_contour(y, a, b, cx, cz)}
+            print(f"[{name}] y={y:.3f} half_w_kp={half_width:.3f} "
+                  f"a={a:.3f} b={b:.3f} perim={ellipse_perimeter(a, b)*100:.1f}cm")
             return ellipse_perimeter(a, b) * 100.0
 
         def limb_circumf(y, name, target_x, x_radius=0.10):

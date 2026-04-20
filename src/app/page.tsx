@@ -5,11 +5,12 @@ import dynamic from "next/dynamic";
 import PoseCapture, { CapturedPose, PoseKey } from "@/components/PoseCapture";
 import VideoCapture360 from "@/components/VideoCapture360";
 import MeasurementResults from "@/components/MeasurementResults";
+import CaptureInstructions from "@/components/CaptureInstructions";
 
 const BodyViewer3D = dynamic(() => import("@/components/BodyViewer3D"), { ssr: false });
 
 type Mode = "standard" | "premium";
-type Status = "idle" | "capturing" | "form" | "analyzing" | "done" | "error";
+type Status = "idle" | "instructions" | "capturing" | "form" | "analyzing" | "done" | "error";
 
 interface SliceData {
   y: number;
@@ -205,7 +206,7 @@ export default function Home() {
               <button
                 onClick={() => {
                   setMode("standard");
-                  setStatus("capturing");
+                  setStatus("instructions");
                 }}
                 className="glass rounded-2xl p-8 text-left hover:bg-[var(--surface-light)] transition-colors"
               >
@@ -218,7 +219,7 @@ export default function Home() {
               <button
                 onClick={() => {
                   setMode("premium");
-                  setStatus("capturing");
+                  setStatus("instructions");
                 }}
                 className="glass rounded-2xl p-8 text-left hover:bg-[var(--surface-light)] transition-colors border-2 border-[var(--accent)]/30"
               >
@@ -234,6 +235,14 @@ export default function Home() {
               </button>
             </div>
           </div>
+        )}
+
+        {/* Instructions */}
+        {status === "instructions" && (
+          <CaptureInstructions
+            onContinue={() => setStatus("capturing")}
+            onBack={() => setStatus("idle")}
+          />
         )}
 
         {/* Capture */}

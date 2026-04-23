@@ -850,7 +850,12 @@ class BodyScanner:
         if side is None:
             side = all_silhouettes.get("right")
         if side is not None:
-            pifu_mesh = self._correct_mesh_depth_with_silhouette(pifu_mesh, side, height_cm)
+            try:
+                pifu_mesh = self._correct_mesh_depth_with_silhouette(pifu_mesh, side, height_cm)
+            except Exception as e:
+                print(f"Mesh depth correction failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         # 4. MediaPipe keypoints on front photo, mapped to mesh frame
         print("Detecting keypoints (MediaPipe)...")

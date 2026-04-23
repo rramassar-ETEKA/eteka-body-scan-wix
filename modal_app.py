@@ -255,6 +255,133 @@ class BodyScanner:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    def _fit_mesh_to_visual_hull(self, mesh, silhouettes, height_cm):
+        """
+        Fit PIFuHD mesh to the visual hull built from all 4 silhouettes.
+        For each vertex: cast a ray from body axis (0, y, 0) outward through
+        the vertex in XZ plane; find the hull boundary along that ray and
+        move the vertex there. The resulting mesh, re-projected to any of
+        the 4 views, matches the binary silhouette of that view.
+        """
+        import numpy as np
+        import trimesh
+
+        if not silhouettes or len(silhouettes) < 2:
+            return mesh
+
+        body_h_mm = height_cm * 10.0
+        body_w_mm = body_h_mm * 0.55
+        body_d_mm = body_h_mm * 0.40
+        voxel_size_mm = 5
+
+        nx = max(int(body_w_mm / voxel_size_mm), 48)
+        ny = max(int(body_h_mm / voxel_size_mm), 128)
+        nz = max(int(body_d_mm / voxel_size_mm), 48)
+        print(f"Visual hull voxel grid: {nx}x{ny}x{nz}")
+
+        x_coords = (np.arange(nx) + 0.5) * voxel_size_mm - body_w_mm / 2
+        y_coords = (np.arange(ny) + 0.5) * voxel_size_mm
+        z_coords = (np.arange(nz) + 0.5) * voxel_size_mm - body_d_mm / 2
+
+        voxels = np.ones((nx, ny, nz), dtype=bool)
+
+        def crop_sil(sil):
+            rows = np.any(sil > 0, axis=1)
+            cols = np.any(sil > 0, axis=0)
+            if not rows.any() or not cols.any():
+                return None
+            t = rows.argmax()
+            b = len(rows) - 1 - rows[::-1].argmax()
+            l = cols.argmax()
+            r = len(cols) - 1 - cols[::-1].argmax()
+            return sil[t:b + 1, l:r + 1].astype(bool)
+
+        for view, sil_raw in silhouettes.items():
+            sil = crop_sil(sil_raw)
+            if sil is None:
+                continue
+            sil_h, sil_w = sil.shape
+            row_idx = np.clip((y_coords / body_h_mm * sil_h).astype(int), 0, sil_h - 1)
+            if view == "front":
+                x_in = x_coords + body_w_mm / 2
+                col_idx = np.clip((x_in / body_w_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_xy = sil[np.ix_(row_idx, col_idx)].T
+                voxels &= mask_xy[:, :, None]
+            elif view == "back":
+                x_in = -x_coords + body_w_mm / 2
+                col_idx = np.clip((x_in / body_w_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_xy = sil[np.ix_(row_idx, col_idx)].T
+                voxels &= mask_xy[:, :, None]
+            elif view == "left":
+                z_in = z_coords + body_d_mm / 2
+                col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_zy = sil[np.ix_(row_idx, col_idx)]
+                voxels &= mask_zy.T[None, :, :]
+            elif view == "right":
+                z_in = -z_coords + body_d_mm / 2
+                col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_zy = sil[np.ix_(row_idx, col_idx)]
+                voxels &= mask_zy.T[None, :, :]
+
+        filled = int(voxels.sum())
+        print(f"Visual hull: {filled} filled voxels ({100*filled/voxels.size:.1f}%)")
+        if filled < 500:
+            print("Visual hull too small, skipping fit")
+            return mesh
+
+        # For each vertex: cast ray from (0, y, 0) outward through vertex in XZ plane.
+        # Find the last filled voxel along ray = hull boundary.
+        verts = mesh.vertices.astype(np.float32)
+        verts_mm = verts * 1000.0
+
+        # Direction in XZ for each vertex
+        xz = verts_mm[:, [0, 2]]
+        dists = np.sqrt((xz ** 2).sum(axis=1))
+        # Avoid division by zero (vertices on the central axis)
+        safe = dists > 0.5
+        dirs = np.zeros_like(xz)
+        dirs[safe] = xz[safe] / dists[safe, None]
+
+        # Y voxel index (clamped)
+        iy = np.clip((verts_mm[:, 1] / voxel_size_mm).astype(int), 0, ny - 1)
+
+        # Walk rays from t=0 to t=max_search, step=voxel_size/2
+        max_search = max(body_w_mm, body_d_mm) / 2 * 1.1
+        steps = np.arange(1, max_search / (voxel_size_mm * 0.5), dtype=np.float32) * (voxel_size_mm * 0.5)
+
+        # Initialize last inside distance per vertex
+        last_inside = np.zeros(len(verts), dtype=np.float32)
+
+        # Vectorized ray march
+        for t in steps:
+            px = t * dirs[:, 0]
+            pz = t * dirs[:, 1]
+            ix = ((px + body_w_mm / 2) / voxel_size_mm).astype(int)
+            iz = ((pz + body_d_mm / 2) / voxel_size_mm).astype(int)
+            valid = (ix >= 0) & (ix < nx) & (iz >= 0) & (iz < nz) & safe
+            filled_mask = np.zeros(len(verts), dtype=bool)
+            if valid.any():
+                filled_mask[valid] = voxels[ix[valid], iy[valid], iz[valid]]
+            # Update last_inside where current ray point is filled
+            last_inside = np.where(filled_mask, t, last_inside)
+
+        # Fallback for vertices that never found a hull boundary: keep original
+        no_hit = last_inside < 1.0
+        last_inside[no_hit] = dists[no_hit]
+
+        # Apply: vertex position = last_inside * direction (XZ). Y unchanged.
+        verts_new = verts.copy()
+        verts_new[:, 0] = (last_inside * dirs[:, 0]) / 1000.0
+        verts_new[:, 2] = (last_inside * dirs[:, 1]) / 1000.0
+
+        # Smooth the mesh to avoid voxel quantization artifacts
+        new_mesh = trimesh.Trimesh(vertices=verts_new, faces=mesh.faces, process=False)
+        try:
+            trimesh.smoothing.filter_taubin(new_mesh, lamb=0.5, nu=-0.53, iterations=5)
+        except Exception:
+            pass
+        return new_mesh
+
     def _correct_mesh_depth_with_silhouette(self, mesh, side_sil, height_cm):
         """
         Deform mesh Z to match side silhouette depth (for pregnancy, abdominal bulge).
@@ -835,15 +962,12 @@ class BodyScanner:
         # 3. Normalize: head at Y=0, feet at height_m
         pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
 
-        # 3b. Correct mesh depth using side silhouette (captures pregnancy, etc.)
-        side = all_silhouettes.get("left")
-        if side is None:
-            side = all_silhouettes.get("right")
-        if side is not None:
+        # 3b. Fit mesh to visual hull from 4 silhouettes (captures pregnancy, etc.)
+        if len(all_silhouettes) >= 2:
             try:
-                pifu_mesh = self._correct_mesh_depth_with_silhouette(pifu_mesh, side, height_cm)
+                pifu_mesh = self._fit_mesh_to_visual_hull(pifu_mesh, all_silhouettes, height_cm)
             except Exception as e:
-                print(f"Mesh depth correction failed: {e}")
+                print(f"Visual hull fit failed: {e}")
                 import traceback
                 traceback.print_exc()
 

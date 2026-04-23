@@ -255,6 +255,72 @@ class BodyScanner:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    def _correct_mesh_depth_with_silhouette(self, mesh, side_sil, height_cm):
+        """
+        Deform mesh Z coordinates so body depth matches side silhouette at each Y.
+        Crucial for capturing pregnancy belly bulge that PIFuHD often underestimates.
+        """
+        import numpy as np
+        from scipy.ndimage import gaussian_filter1d
+        import trimesh
+
+        if side_sil is None:
+            return mesh
+
+        # Find silhouette body bbox
+        rows = np.any(side_sil > 0, axis=1)
+        if not rows.any():
+            return mesh
+        sil_top = rows.argmax()
+        sil_bot = len(rows) - 1 - rows[::-1].argmax()
+        sil_h = sil_bot - sil_top + 1
+
+        verts = mesh.vertices.astype(np.float32)
+        target_h = height_cm / 100.0
+
+        # Compute expected scale factor at N Y levels
+        n_levels = 50
+        y_edges = np.linspace(0, target_h, n_levels + 1)
+        scales = np.ones(n_levels)
+
+        for i in range(n_levels):
+            y_center = (y_edges[i] + y_edges[i + 1]) / 2
+            mask = (verts[:, 1] >= y_edges[i]) & (verts[:, 1] < y_edges[i + 1])
+            if mask.sum() < 5:
+                continue
+            mesh_z_extent = float(verts[mask, 2].max() - verts[mask, 2].min())
+
+            # Silhouette depth at this Y (normalized)
+            y_norm = y_center / target_h
+            y_pix_in_sil = int(sil_top + y_norm * sil_h)
+            y_pix_in_sil = max(0, min(side_sil.shape[0] - 1, y_pix_in_sil))
+            cols = np.where(side_sil[y_pix_in_sil] > 0)[0]
+            if len(cols) < 2:
+                continue
+            sil_depth_m = ((cols.max() - cols.min()) / sil_h) * target_h
+
+            if mesh_z_extent > 1e-4 and sil_depth_m > mesh_z_extent * 1.05:
+                s = sil_depth_m / mesh_z_extent
+                scales[i] = min(s, 1.8)  # cap to avoid artifacts
+
+        # Smooth scales across Y levels for continuous mesh
+        scales = gaussian_filter1d(scales, sigma=1.2)
+
+        n_corrected = (scales > 1.02).sum()
+        print(f"Mesh depth correction: {n_corrected}/{n_levels} levels adjusted "
+              f"(max scale={scales.max():.2f})")
+
+        # Apply per-vertex scaling
+        z_center = verts[:, 2].mean()
+        y_norm_per_vert = verts[:, 1] / target_h
+        level_idx = np.clip((y_norm_per_vert * n_levels).astype(int), 0, n_levels - 1)
+        per_vert_scale = scales[level_idx]
+
+        v_new = verts.copy()
+        v_new[:, 2] = z_center + (verts[:, 2] - z_center) * per_vert_scale
+
+        return trimesh.Trimesh(vertices=v_new, faces=mesh.faces, process=False)
+
     def _normalize_mesh(self, mesh, height_cm, flip_y=None):
         """Scale + translate: head at Y=0, feet at Y=height_m, centered in X/Z.
 
@@ -617,6 +683,32 @@ class BodyScanner:
             c = torso_measure(y, name, alpha)
             if c: measurements[name] = round(c, 1)
 
+        # ----- BELLY: max circumference between waist and hips -----
+        # Captures pregnancy belly, visceral fat, etc.
+        waist_y = anatomical_y['waist']
+        hips_y_a = anatomical_y['hips']
+        if hips_y_a > waist_y + 0.03:
+            n_belly_scan = 20
+            belly_ys = np.linspace(waist_y + 0.02, hips_y_a - 0.02, n_belly_scan)
+            best_perim = 0
+            best_y = None
+            for y in belly_ys:
+                alpha = (y - shoulder_y) / max(hip_y - shoulder_y, 1e-6)
+                halfw = shoulder_halfw * (1 - alpha) + hip_halfw * alpha
+                r = torso_convex_hull(y, halfw)
+                if r is not None:
+                    _, _, _, p, _ = r
+                    if p > best_perim:
+                        best_perim = p
+                        best_y = y
+            if best_y is not None and best_perim > 0:
+                # Only report if significantly larger than waist (>5cm more)
+                waist_perim = measurements.get('waist', 0) / 100.0
+                if best_perim > waist_perim + 0.03:
+                    alpha = (best_y - shoulder_y) / max(hip_y - shoulder_y, 1e-6)
+                    c = torso_measure(best_y, "belly", alpha)
+                    if c: measurements["belly"] = round(c, 1)
+
         # ----- LIMB helpers -----
         def slice_vertices(y, tolerance=0.015):
             mask = np.abs(mesh_verts[:, 1] - y) < tolerance
@@ -736,6 +828,13 @@ class BodyScanner:
 
         # 3. Normalize: head at Y=0, feet at height_m
         pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
+
+        # 3b. Correct mesh depth using side silhouette (captures pregnancy, etc.)
+        side = all_silhouettes.get("left")
+        if side is None:
+            side = all_silhouettes.get("right")
+        if side is not None:
+            pifu_mesh = self._correct_mesh_depth_with_silhouette(pifu_mesh, side, height_cm)
 
         # 4. MediaPipe keypoints on front photo, mapped to mesh frame
         print("Detecting keypoints (MediaPipe)...")

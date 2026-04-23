@@ -13,6 +13,7 @@ const CIRCUMFERENCE_LABELS: Record<string, string> = {
   chest: "Poitrine",
   underbust: "Sous-poitrine",
   waist: "Taille",
+  belly: "Ventre",
   hips: "Hanches",
   thigh: "Cuisse",
   knee: "Genou",

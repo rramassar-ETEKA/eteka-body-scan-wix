@@ -257,8 +257,10 @@ class BodyScanner:
 
     def _correct_mesh_depth_with_silhouette(self, mesh, side_sil, height_cm):
         """
-        Deform mesh Z coordinates so body depth matches side silhouette at each Y.
-        Crucial for capturing pregnancy belly bulge that PIFuHD often underestimates.
+        Deform mesh Z so body depth matches side silhouette at each Y.
+        - Smooth interpolation across Y (no staircase)
+        - ASYMMETRIC offset: pushes only the FRONT (belly side) forward,
+          keeping the back unchanged (correct for pregnancy, abdominal bulge)
         """
         import numpy as np
         from scipy.ndimage import gaussian_filter1d
@@ -267,7 +269,6 @@ class BodyScanner:
         if side_sil is None:
             return mesh
 
-        # Find silhouette body bbox
         rows = np.any(side_sil > 0, axis=1)
         if not rows.any():
             return mesh
@@ -278,10 +279,11 @@ class BodyScanner:
         verts = mesh.vertices.astype(np.float32)
         target_h = height_cm / 100.0
 
-        # Compute expected scale factor at N Y levels
-        n_levels = 50
+        # For each Y level: compute the EXTRA depth that needs to be added
+        # (we push front forward rather than scaling symmetrically)
+        n_levels = 80
         y_edges = np.linspace(0, target_h, n_levels + 1)
-        scales = np.ones(n_levels)
+        extra_front_depth = np.zeros(n_levels)  # meters to add to front (max Z) side
 
         for i in range(n_levels):
             y_center = (y_edges[i] + y_edges[i + 1]) / 2
@@ -290,7 +292,6 @@ class BodyScanner:
                 continue
             mesh_z_extent = float(verts[mask, 2].max() - verts[mask, 2].min())
 
-            # Silhouette depth at this Y (normalized)
             y_norm = y_center / target_h
             y_pix_in_sil = int(sil_top + y_norm * sil_h)
             y_pix_in_sil = max(0, min(side_sil.shape[0] - 1, y_pix_in_sil))
@@ -299,25 +300,40 @@ class BodyScanner:
                 continue
             sil_depth_m = ((cols.max() - cols.min()) / sil_h) * target_h
 
-            if mesh_z_extent > 1e-4 and sil_depth_m > mesh_z_extent * 1.05:
-                s = sil_depth_m / mesh_z_extent
-                scales[i] = min(s, 1.8)  # cap to avoid artifacts
+            if mesh_z_extent > 1e-4 and sil_depth_m > mesh_z_extent + 0.005:
+                extra = sil_depth_m - mesh_z_extent
+                extra_front_depth[i] = min(extra, 0.18)  # cap at 18cm
 
-        # Smooth scales across Y levels for continuous mesh
-        scales = gaussian_filter1d(scales, sigma=1.2)
+        # Smooth along Y with Gaussian (wide sigma for no visible bands)
+        extra_smooth = gaussian_filter1d(extra_front_depth, sigma=3.0)
 
-        n_corrected = (scales > 1.02).sum()
-        print(f"Mesh depth correction: {n_corrected}/{n_levels} levels adjusted "
-              f"(max scale={scales.max():.2f})")
+        n_corrected = (extra_smooth > 0.01).sum()
+        print(f"Mesh depth correction: {n_corrected}/{n_levels} levels "
+              f"(max extra={extra_smooth.max()*100:.1f}cm, asymmetric forward push)")
 
-        # Apply per-vertex scaling
-        z_center = verts[:, 2].mean()
-        y_norm_per_vert = verts[:, 1] / target_h
-        level_idx = np.clip((y_norm_per_vert * n_levels).astype(int), 0, n_levels - 1)
-        per_vert_scale = scales[level_idx]
+        # Continuous level index for smooth interpolation
+        y_norm_per_vert = np.clip(verts[:, 1] / target_h, 0, 0.999)
+        level_f = y_norm_per_vert * n_levels - 0.5
+        level_lo = np.clip(np.floor(level_f).astype(int), 0, n_levels - 1)
+        level_hi = np.clip(level_lo + 1, 0, n_levels - 1)
+        t = np.clip(level_f - level_lo, 0, 1)
+        per_vert_extra = extra_smooth[level_lo] * (1 - t) + extra_smooth[level_hi] * t
+
+        # Front = positive Z side. Apply gradient: vertices far from back edge
+        # get more of the extra depth. Vertices at back edge don't move.
+        z_min = verts[:, 2].min()
+        z_max = verts[:, 2].max()
+        z_range = max(z_max - z_min, 1e-4)
+        # Front weight: 0 at z_min (back), 1 at z_max (front), smooth with cosine
+        front_weight = np.clip((verts[:, 2] - z_min) / z_range, 0, 1)
+        # Soften so only the front third gets pushed
+        front_weight = np.where(front_weight > 0.5,
+                                (front_weight - 0.5) * 2.0,  # 0 at mid, 1 at max
+                                0.0)
+        front_weight = np.clip(front_weight, 0, 1) ** 1.5  # ease-in
 
         v_new = verts.copy()
-        v_new[:, 2] = z_center + (verts[:, 2] - z_center) * per_vert_scale
+        v_new[:, 2] = verts[:, 2] + per_vert_extra * front_weight
 
         return trimesh.Trimesh(vertices=v_new, faces=mesh.faces, process=False)
 

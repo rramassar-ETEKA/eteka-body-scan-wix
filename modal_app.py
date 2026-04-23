@@ -396,19 +396,26 @@ class BodyScanner:
         side_sil_h = None
         side_top_y = 0
         if silhouettes is not None:
+            sil_keys = list(silhouettes.keys())
+            print(f"Silhouettes available: {sil_keys}")
             # Prefer left profile (or right) - profile views give Z depth
             candidate = silhouettes.get("left")
+            source = "left"
             if candidate is None:
                 candidate = silhouettes.get("right")
+                source = "right"
             if candidate is not None:
                 import numpy as np
-                # Find body bbox in silhouette (already cropped but re-find if needed)
                 rows = np.any(candidate > 0, axis=1)
                 if rows.any():
                     side_top_y = rows.argmax()
                     side_bot_y = len(rows) - 1 - rows[::-1].argmax()
                     side_sil_h = side_bot_y - side_top_y + 1
                     side_sil = candidate
+                    print(f"Using {source} silhouette: shape={candidate.shape} "
+                          f"bbox_h={side_sil_h}px")
+            else:
+                print("No side silhouette available for depth correction")
 
         def silhouette_depth_m(y_mesh):
             """Get body depth (Z) in meters at mesh Y level, from side silhouette."""
@@ -482,6 +489,8 @@ class BodyScanner:
             # Silhouette-based depth correction (captures pregnancy belly bulge)
             sil_depth = silhouette_depth_m(y)
             if sil_depth is not None and sil_depth > depth_z * 1.05:
+                print(f"  DEPTH CORRECTION y={y:.3f} mesh_z={depth_z*100:.1f}cm "
+                      f"sil_z={sil_depth*100:.1f}cm scale={sil_depth/max(depth_z,1e-4):.2f}")
                 # Side silhouette shows greater depth than mesh -> scale Z to match
                 z_scale = sil_depth / max(depth_z, 1e-4)
                 z_scale = min(z_scale, 1.8)  # cap at 1.8x to avoid artifacts

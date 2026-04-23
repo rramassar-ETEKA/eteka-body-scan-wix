@@ -315,13 +315,14 @@ class BodyScanner:
             elif view == "left":
                 z_in = z_coords + body_d_mm / 2
                 col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
-                mask_zy = sil[np.ix_(row_idx, col_idx)]
-                voxels &= mask_zy.T[None, :, :]
+                # sil[np.ix_(row_idx, col_idx)] shape: (ny, nz). Need (1, ny, nz).
+                mask_yz = sil[np.ix_(row_idx, col_idx)]
+                voxels &= mask_yz[None, :, :]
             elif view == "right":
                 z_in = -z_coords + body_d_mm / 2
                 col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
-                mask_zy = sil[np.ix_(row_idx, col_idx)]
-                voxels &= mask_zy.T[None, :, :]
+                mask_yz = sil[np.ix_(row_idx, col_idx)]
+                voxels &= mask_yz[None, :, :]
 
         filled = int(voxels.sum())
         print(f"Visual hull: {filled} filled voxels ({100*filled/voxels.size:.1f}%)")

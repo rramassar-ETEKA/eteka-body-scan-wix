@@ -386,17 +386,50 @@ export default function Home() {
               />
             )}
 
-            <div className="grid md:grid-cols-2 gap-6">
-              {previewUrl && (
-                <div className="glass rounded-2xl p-4">
-                  <img src={previewUrl} alt="Vue de face" className="w-full max-h-[500px] object-contain rounded-xl" />
-                  <div className="mt-3 text-center text-sm text-[var(--foreground)]/60">
-                    {height} cm / {weight} kg / {gender}
-                  </div>
+            {/* 4 photos grid (Standard mode) for comparison with 3D model */}
+            {mode === "standard" && photos && (
+              <div className="glass rounded-2xl p-4">
+                <div className="text-sm font-semibold mb-3 text-[var(--foreground)]/70 text-center">
+                  Vos 4 photos
                 </div>
-              )}
-              <MeasurementResults measurements={result.measurements} />
-            </div>
+                <div className="grid grid-cols-4 gap-2">
+                  {(["front", "left", "back", "right"] as const).map((key) => {
+                    const labels: Record<string, string> = {
+                      front: "Face",
+                      left: "Profil G",
+                      back: "Dos",
+                      right: "Profil D",
+                    };
+                    return (
+                      <div key={key} className="space-y-1">
+                        <img
+                          src={photos[key].preview}
+                          alt={labels[key]}
+                          className="w-full aspect-[3/4] object-cover rounded-lg"
+                        />
+                        <div className="text-xs text-center text-[var(--foreground)]/50">
+                          {labels[key]}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-3 text-center text-sm text-[var(--foreground)]/60">
+                  {height} cm / {weight} kg / {gender}
+                </div>
+              </div>
+            )}
+
+            {mode === "premium" && previewUrl && (
+              <div className="glass rounded-2xl p-4">
+                <video src={previewUrl} controls className="w-full max-h-[400px] rounded-xl" />
+                <div className="mt-3 text-center text-sm text-[var(--foreground)]/60">
+                  {height} cm / {weight} kg / {gender}
+                </div>
+              </div>
+            )}
+
+            <MeasurementResults measurements={result.measurements} />
           </div>
         )}
       </main>

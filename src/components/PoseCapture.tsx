@@ -53,8 +53,18 @@ function SilhouetteSVG({ pose }: { pose: PoseKey }) {
       </svg>
     );
   }
+  // Left profile: subject's left side toward camera (body facing right in image)
+  // Right profile: subject's right side toward camera (body facing left in image)
+  const facingRight = pose === "left";
   return (
-    <svg viewBox="0 0 100 200" className="pose-silhouette w-full h-full" fill="none" stroke="currentColor" strokeWidth="1.5">
+    <svg
+      viewBox="0 0 100 200"
+      className="pose-silhouette w-full h-full"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      style={{ transform: facingRight ? "none" : "scaleX(-1)" }}
+    >
       <circle cx="50" cy="20" r="10" />
       <path d="M 50 30 L 50 100" />
       <path d="M 50 50 L 40 90" />

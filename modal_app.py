@@ -255,9 +255,11 @@ class BodyScanner:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
-    def _normalize_mesh(self, mesh, height_cm):
+    def _normalize_mesh(self, mesh, height_cm, flip_y=None):
         """Scale + translate: head at Y=0, feet at Y=height_m, centered in X/Z.
-        Also detects and flips Y if mesh is upside down.
+
+        flip_y: bool or None. If None, auto-detect via narrow-end heuristic.
+                If True, flip Y. If False, no flip.
         """
         import numpy as np
         import trimesh
@@ -268,15 +270,18 @@ class BodyScanner:
         if h < 1e-6:
             return mesh
 
-        # Check if mesh is upside down (widest part in top half = inverted)
-        n_levels = 20
-        widths = []
-        for i in range(n_levels):
-            y0 = y_min + i * h / n_levels
-            y1 = y_min + (i + 1) * h / n_levels
-            mask = (v[:, 1] >= y0) & (v[:, 1] < y1)
-            widths.append(v[mask, 0].max() - v[mask, 0].min() if mask.sum() > 5 else 0)
-        widest = int(np.argmax(widths))
+        # Auto-detect flip if not provided: compare width of top 10% vs bottom 10%.
+        # Head region has narrow width (neck+head) vs legs region (two legs spread).
+        # The NARROWER END is the head.
+        if flip_y is None:
+            top10 = v[:, 1] < y_min + h * 0.1
+            bot10 = v[:, 1] > y_max - h * 0.1
+            top_w = (v[top10, 0].max() - v[top10, 0].min()) if top10.sum() > 5 else 0
+            bot_w = (v[bot10, 0].max() - v[bot10, 0].min()) if bot10.sum() > 5 else 0
+            # If bottom is narrower (= head at bottom in PIFuHD frame), flip
+            # Otherwise head is already at top
+            flip_y = bot_w < top_w
+            print(f"Auto-flip: top_w={top_w:.3f} bot_w={bot_w:.3f} flip={flip_y}")
 
         target_h = height_cm / 100.0
         scale = target_h / h
@@ -284,9 +289,7 @@ class BodyScanner:
         z_mean = v[:, 2].mean()
 
         v_new = v.copy()
-        if widest < n_levels // 2:
-            # upside down: flip Y before scaling
-            print("Mesh upside down, flipping Y")
+        if flip_y:
             v_new[:, 1] = y_max + y_min - v[:, 1]
             v_new[:, 1] = (v_new[:, 1] - y_min) * scale
         else:
@@ -320,7 +323,26 @@ class BodyScanner:
                                 float(candidates[idx, 2])]
         return kp_snapped
 
-    def _measurements_from_mesh(self, mesh, kp, height_cm):
+    def _silhouette_depth_at_y(self, side_sil, y_norm):
+        """
+        Get the depth (width of side silhouette) at normalized Y level.
+        Side silhouette shows the body's front-to-back extent = Z depth.
+        y_norm: 0 = top of body, 1 = bottom.
+        Returns depth in meters (assuming body height = silhouette height).
+        """
+        import numpy as np
+        if side_sil is None:
+            return None
+        h, w = side_sil.shape
+        y_pix = int(y_norm * (h - 1))
+        y_pix = max(0, min(h - 1, y_pix))
+        cols = np.where(side_sil[y_pix] > 0)[0]
+        if len(cols) == 0:
+            return None
+        width_pix = cols.max() - cols.min()
+        return width_pix  # in pixels
+
+    def _measurements_from_mesh(self, mesh, kp, height_cm, silhouettes=None):
         """
         Anatomically-driven measurement pipeline:
           1. Scan mesh cross-sections along Y from shoulders to below hips
@@ -367,6 +389,36 @@ class BodyScanner:
         mesh_verts = mesh.vertices
         shoulder_halfw = abs(ls[0] - rs[0]) / 2
         hip_halfw = abs(lh[0] - rh[0]) / 2
+
+        # Pre-process side silhouettes for depth correction (pregnancy, etc.)
+        target_h = height_cm / 100.0
+        side_sil = None
+        side_sil_h = None
+        side_top_y = 0
+        if silhouettes is not None:
+            # Prefer left profile (or right) - profile views give Z depth
+            candidate = silhouettes.get("left") or silhouettes.get("right")
+            if candidate is not None:
+                import numpy as np
+                # Find body bbox in silhouette (already cropped but re-find if needed)
+                rows = np.any(candidate > 0, axis=1)
+                if rows.any():
+                    side_top_y = rows.argmax()
+                    side_bot_y = len(rows) - 1 - rows[::-1].argmax()
+                    side_sil_h = side_bot_y - side_top_y + 1
+                    side_sil = candidate
+
+        def silhouette_depth_m(y_mesh):
+            """Get body depth (Z) in meters at mesh Y level, from side silhouette."""
+            if side_sil is None or side_sil_h is None:
+                return None
+            # Mesh Y: 0=top, target_h=bottom. Normalize.
+            y_norm = y_mesh / target_h
+            pix = self._silhouette_depth_at_y(side_sil, y_norm)
+            if pix is None or side_sil_h <= 0:
+                return None
+            # Convert pixels to meters using body height calibration
+            return (pix / side_sil_h) * target_h
 
         from shapely.geometry import MultiPoint
 
@@ -424,6 +476,27 @@ class BodyScanner:
             bounds = hull.bounds
             width_x = bounds[2] - bounds[0]
             depth_z = bounds[3] - bounds[1]
+
+            # Silhouette-based depth correction (captures pregnancy belly bulge)
+            sil_depth = silhouette_depth_m(y)
+            if sil_depth is not None and sil_depth > depth_z * 1.05:
+                # Side silhouette shows greater depth than mesh -> scale Z to match
+                z_scale = sil_depth / max(depth_z, 1e-4)
+                z_scale = min(z_scale, 1.8)  # cap at 1.8x to avoid artifacts
+                # Rebuild hull with scaled Z
+                z_center = (bounds[1] + bounds[3]) / 2
+                pts_scaled = pts.copy()
+                pts_scaled[:, 1] = z_center + (pts[:, 1] - z_center) * z_scale
+                try:
+                    hull2 = MultiPoint([(p[0], p[1]) for p in pts_scaled]).convex_hull
+                    if hull2.geom_type == 'Polygon':
+                        hull = hull2
+                        bounds = hull.bounds
+                        width_x = bounds[2] - bounds[0]
+                        depth_z = bounds[3] - bounds[1]
+                except Exception:
+                    pass
+
             perim = hull.exterior.length
             return hull, width_x, depth_z, perim, gap_found
 
@@ -626,37 +699,47 @@ class BodyScanner:
         return measurements, slices_3d
 
     def _do_analyze(self, photos: dict, height_cm: float):
-        """Fully non-parametric pipeline: PIFuHD + MediaPipe."""
+        """Fully non-parametric pipeline: PIFuHD + MediaPipe + silhouette depth correction."""
         import numpy as np
 
-        # 1. Silhouette + bbox of front photo
-        print("Extracting silhouette...")
-        sil, bbox, img_size = self._silhouette_and_bbox(photos["front"])
-        if bbox is None:
+        # 1. Silhouettes from all 4 views (for depth correction at belly level)
+        print("Extracting silhouettes from all views...")
+        all_silhouettes = {}
+        front_bbox = None
+        front_img_size = None
+        for view, img_bytes in photos.items():
+            sil, bbox, img_size = self._silhouette_and_bbox(img_bytes)
+            if sil is not None:
+                all_silhouettes[view] = sil
+            if view == "front":
+                front_bbox = bbox
+                front_img_size = img_size
+
+        if front_bbox is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # 2. PIFuHD reconstruction
-        pifu_mesh = self._run_pifuhd(photos["front"], bbox, img_size)
+        # 2. PIFuHD reconstruction from front photo
+        pifu_mesh = self._run_pifuhd(photos["front"], front_bbox, front_img_size)
         if pifu_mesh is None:
             return {"error": "Reconstruction 3D echouee"}
 
         # 3. Normalize: head at Y=0, feet at height_m
         pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
 
-        # 4. MediaPipe keypoints on original photo, mapped to mesh frame
+        # 4. MediaPipe keypoints on front photo, mapped to mesh frame
         print("Detecting keypoints (MediaPipe)...")
-        kp_norm = self._detect_pose_keypoints(photos["front"], bbox, img_size)
+        kp_norm = self._detect_pose_keypoints(photos["front"], front_bbox, front_img_size)
         if kp_norm is None:
             return {"error": "Keypoints non detectes"}
 
         mesh_bounds = pifu_mesh.bounds
         kp_on_mesh = self._map_kp_to_mesh(kp_norm, mesh_bounds, height_cm)
-
-        # Snap keypoints to mesh surface for clean visualization
         kp_snapped = self._snap_keypoints_to_mesh(kp_on_mesh, pifu_mesh)
 
-        # 5. Measurements via slicing
-        measurements, slices_3d = self._measurements_from_mesh(pifu_mesh, kp_snapped, height_cm)
+        # 5. Measurements via slicing (with silhouette-based depth correction)
+        measurements, slices_3d = self._measurements_from_mesh(
+            pifu_mesh, kp_snapped, height_cm, silhouettes=all_silhouettes
+        )
 
         return {
             "success": True,

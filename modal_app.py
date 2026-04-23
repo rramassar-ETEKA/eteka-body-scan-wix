@@ -397,7 +397,9 @@ class BodyScanner:
         side_top_y = 0
         if silhouettes is not None:
             # Prefer left profile (or right) - profile views give Z depth
-            candidate = silhouettes.get("left") or silhouettes.get("right")
+            candidate = silhouettes.get("left")
+            if candidate is None:
+                candidate = silhouettes.get("right")
             if candidate is not None:
                 import numpy as np
                 # Find body bbox in silhouette (already cropped but re-find if needed)

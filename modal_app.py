@@ -201,32 +201,67 @@ class BodyScanner:
         ]
         return {"lm_2d": lm_2d, "lm_3d": lm_3d, "img_size": (W, H)}
 
-    def _estimate_orientation_deg(self, lm_3d):
+    def _estimate_orientation_deg(self, lm_2d):
         """
-        Estimate body rotation around the vertical (Y) axis from world landmarks.
-        Returns angle in [0, 360) where:
-          0   = facing camera
-          90  = subject turned 90 deg to their right (camera sees their right side)
-          180 = back to camera
-          270 = subject turned 90 deg to their left (camera sees their left side)
+        Estimate body rotation around the vertical (Y) axis from 2D landmark VISIBILITY
+        scores (much more reliable than MediaPipe world Z which is noisy in profile).
 
-        MediaPipe world landmarks: hip-centered meters. +X = subject's left (image
-        right when facing), +Z = away from camera. The forward vector (hip -> nose)
-        in the (X, Z) plane gives the facing direction.
+        MediaPipe Pose visibility goes high when a landmark is visible to the camera.
+        - At theta=0 (facing camera): nose visible, both eyes/ears visible
+        - At theta=90 (subject turned right, camera sees subject's LEFT side): left
+          eye/ear visible, right eye/ear hidden
+        - At theta=180 (back): no face visible
+        - At theta=270 (subject turned left, camera sees subject's RIGHT side): right
+          eye/ear visible, left hidden
+
+        Map (front_back, left_right) to angle via atan2.
+
+        MediaPipe landmark indices: 0=nose, 1-3=left eye trio, 4-6=right eye trio,
+        7=left ear, 8=right ear.
+
+        Returns angle in [0, 360).
         """
-        import numpy as np
-        nose = lm_3d[0]
-        lh = lm_3d[23]
-        rh = lm_3d[24]
-        hip_x = (lh["x"] + rh["x"]) / 2
-        hip_z = (lh["z"] + rh["z"]) / 2
-        fx = nose["x"] - hip_x
-        fz = nose["z"] - hip_z
-        # Angle measured from -Z (facing camera) clockwise (toward -X = subject's right)
-        angle_deg = float(np.degrees(np.arctan2(-fx, -fz)))
+        import math
+        nose_v = lm_2d[0]["vis"]
+        left_face = (lm_2d[1]["vis"] + lm_2d[2]["vis"] + lm_2d[3]["vis"] + lm_2d[7]["vis"]) / 4.0
+        right_face = (lm_2d[4]["vis"] + lm_2d[5]["vis"] + lm_2d[6]["vis"] + lm_2d[8]["vis"]) / 4.0
+        side_score = left_face - right_face        # +1 = subject's LEFT side toward camera (theta~90)
+        front_back = nose_v * 2.0 - 1.0            # +1 = front, -1 = back
+
+        # atan2(side, front_back):
+        #   front (1, 0): atan2(0, 1)  = 0
+        #   left-side-visible (0.something, +1): atan2(+1, ~0) = 90
+        #   back (-1, 0): atan2(0, -1) = 180 (or -180)
+        #   right-side-visible (0.something, -1): atan2(-1, ~0) = -90 = 270
+        angle_deg = math.degrees(math.atan2(side_score, front_back))
         if angle_deg < 0:
             angle_deg += 360.0
         return angle_deg
+
+    def _hip_centered_silhouette(self, sil_crop, bbox, hip_px_x):
+        """
+        Take a silhouette already cropped to its tight bbox and pad it horizontally
+        so that hip_px_x (in original full-image coords) lands on the horizontal
+        center of the returned silhouette.
+
+        This makes the visual hull rotation axis (= silhouette horizontal center)
+        align with the actual subject's vertical axis, even when the camera was
+        handheld and not perfectly centered on the subject.
+        """
+        import numpy as np
+        x1, _, x2, _ = bbox
+        sil_h, sil_w = sil_crop.shape
+        hip_local = float(hip_px_x) - float(x1)
+        hip_local = max(0.0, min(float(sil_w), hip_local))
+        half_w = int(round(max(hip_local, sil_w - hip_local)))
+        if half_w <= 0:
+            return sil_crop.astype(bool)
+        new_w = 2 * half_w
+        new_sil = np.zeros((sil_h, new_w), dtype=bool)
+        x0 = half_w - int(round(hip_local))
+        x0 = max(0, min(new_w - sil_w, x0))
+        new_sil[:, x0:x0 + sil_w] = sil_crop.astype(bool)
+        return new_sil
 
     def _map_kp_to_mesh(self, kp_norm, mesh_bounds, height_cm):
         """
@@ -1426,8 +1461,13 @@ class BodyScanner:
             pose = self._pose_full(jpeg, model_complexity=1)
             if pose is None:
                 continue
-            angle = self._estimate_orientation_deg(pose["lm_3d"])
-            scored.append({"jpeg": jpeg, "blur": blur, "angle": angle})
+            angle = self._estimate_orientation_deg(pose["lm_2d"])
+            # Hip x in pixel coords for later silhouette recentering
+            hip_px_x = (pose["lm_2d"][23]["x"] + pose["lm_2d"][24]["x"]) / 2.0
+            scored.append({
+                "jpeg": jpeg, "blur": blur, "angle": angle,
+                "hip_px_x": float(hip_px_x), "img_w": pose["img_size"][0],
+            })
 
         if len(scored) < 4:
             return {"error": "Pose detectee sur trop peu de frames"}
@@ -1449,11 +1489,11 @@ class BodyScanner:
             if not bucket:
                 continue
             best = max(bucket, key=lambda x: x["blur"])
-            selected.append((best["angle"], best["jpeg"]))
+            selected.append((best["angle"], best["jpeg"], best["hip_px_x"]))
         selected.sort(key=lambda x: x[0])
 
         covered = len(selected)
-        angles_str = ",".join(f"{a:.0f}" for a, _ in selected)
+        angles_str = ",".join(f"{a:.0f}" for a, _, _ in selected)
         print(f"Selected {covered}/{n_frames} frames covering angles: [{angles_str}]")
         if covered < 4:
             return {"error": f"Couverture angulaire insuffisante ({covered} vues)"}
@@ -1524,21 +1564,27 @@ class BodyScanner:
 
     def _do_analyze_video(self, frames, height_cm):
         """
-        Process N frames (angle, jpeg_bytes) from rotating video.
+        Process N frames (angle, jpeg_bytes, hip_px_x) from rotating video.
         Each frame is a different angle (0..360 deg).
+        Silhouettes are recentered horizontally on the MediaPipe hip x position
+        so the visual hull rotation axis matches the actual body axis.
         """
         import numpy as np
 
         n = len(frames)
         print(f"Analyzing {n} frames (angles {frames[0][0]:.0f}..{frames[-1][0]:.0f} deg)")
 
-        # Extract silhouettes for all frames
-        print("Extracting silhouettes...")
-        silhouettes = []  # list of (angle, silhouette_2d, bbox, img_size)
-        for angle, img_bytes in frames:
+        # Extract silhouettes + hip-recenter horizontally
+        print("Extracting silhouettes (with hip recentering)...")
+        silhouettes = []  # list of (angle, hip_centered_silhouette, bbox, img_size)
+        raw_for_measure = []  # (angle, raw_tight_sil) for side silhouette in measurements
+        for angle, img_bytes, hip_px_x in frames:
             sil, bbox, img_size = self._silhouette_and_bbox(img_bytes)
-            if sil is not None:
-                silhouettes.append((angle, sil, bbox, img_size))
+            if sil is None:
+                continue
+            sil_centered = self._hip_centered_silhouette(sil, bbox, hip_px_x)
+            silhouettes.append((angle, sil_centered, bbox, img_size))
+            raw_for_measure.append((angle, sil))
 
         if len(silhouettes) < 4:
             return {"error": "Trop peu de silhouettes valides"}
@@ -1551,7 +1597,7 @@ class BodyScanner:
 
         hull_mesh = self._normalize_mesh(hull_mesh, height_cm, flip_y=False)
 
-        # MediaPipe on the first frame (typically front)
+        # MediaPipe on the first frame (closest to angle 0 = front)
         first_img = frames[0][1]
         sil0, bbox0, img_size0 = self._silhouette_and_bbox(first_img)
         print("Detecting keypoints (MediaPipe)...")
@@ -1563,21 +1609,24 @@ class BodyScanner:
         kp_on_mesh = self._map_kp_to_mesh(kp_norm, mesh_bounds, height_cm)
         kp_snapped = self._snap_keypoints_to_mesh(kp_on_mesh, hull_mesh)
 
-        # Measurements
-        silhouettes_dict = {"front": silhouettes[0][1]}
-        mid_idx = n // 4
-        if mid_idx < len(silhouettes):
-            silhouettes_dict["left"] = silhouettes[mid_idx][1]
+        # Measurements: pass front (raw, tight) and the frame closest to 90deg as side
+        silhouettes_dict = {"front": raw_for_measure[0][1]}
+        # Find the frame with angle closest to 90deg (subject's right turned to camera = sees subject's left side)
+        # This profile view captures Z-depth (belly bulge for pregnancy)
+        side_idx = min(range(len(raw_for_measure)), key=lambda i: abs(raw_for_measure[i][0] - 90))
+        if abs(raw_for_measure[side_idx][0] - 90) < 45:
+            silhouettes_dict["left"] = raw_for_measure[side_idx][1]
         measurements, slices_3d = self._measurements_from_mesh(
             hull_mesh, kp_snapped, height_cm, silhouettes=silhouettes_dict
         )
 
-        # Multi-view UV texture mapping
+        # Multi-view UV texture mapping (optional - mesh + measurements are the priority)
         uvs = None
         texture_b64 = None
         try:
             print("Applying multi-view UV texture...")
-            uvs, texture_b64 = self._apply_uv_texture_multiview(hull_mesh, frames)
+            tex_frames = [(a, j) for a, j, _ in frames]
+            uvs, texture_b64 = self._apply_uv_texture_multiview(hull_mesh, tex_frames)
         except Exception as e:
             print(f"UV texture failed: {e}")
             import traceback
@@ -1623,15 +1672,14 @@ class BodyScanner:
         voxels = np.ones((nx, ny, nz), dtype=bool)
 
         def crop_sil(sil):
+            # Vertical crop only: keep horizontal extent intact so caller-supplied
+            # hip-centered padding is preserved (= rotation axis at horizontal center).
             rows = np.any(sil > 0, axis=1)
-            cols = np.any(sil > 0, axis=0)
-            if not rows.any() or not cols.any():
+            if not rows.any():
                 return None
             t = rows.argmax()
             b = len(rows) - 1 - rows[::-1].argmax()
-            l = cols.argmax()
-            r = len(cols) - 1 - cols[::-1].argmax()
-            return sil[t:b + 1, l:r + 1].astype(bool)
+            return sil[t:b + 1, :].astype(bool)
 
         # For each angle, rotate voxel positions and project to silhouette
         for angle_deg, sil_raw, _, _ in silhouettes_with_angle:

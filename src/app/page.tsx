@@ -39,7 +39,8 @@ export default function Home() {
   const [error, setError] = useState<string>("");
   const [embedMode, setEmbedMode] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
-  const [analyzePhase, setAnalyzePhase] = useState<"upload" | "processing">("upload");
+  const [extractPct, setExtractPct] = useState(0);
+  const [analyzePhase, setAnalyzePhase] = useState<"extract" | "upload" | "processing">("upload");
   const mainRef = useRef<HTMLDivElement>(null);
 
   // Detect embed mode from URL param
@@ -74,6 +75,86 @@ export default function Home() {
     setStatus("form");
   };
 
+  const extractVideoFrames = async (
+    file: File,
+    count = 32,
+    onProgress?: (i: number, total: number) => void,
+    maxDim = 1280,
+    quality = 0.85,
+  ): Promise<File[]> => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.src = url;
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+
+    await new Promise<void>((resolve, reject) => {
+      video.onloadedmetadata = () => resolve();
+      video.onerror = () => reject(new Error("Lecture video impossible"));
+    });
+
+    // WebM from MediaRecorder often has Infinity duration; force a metadata refresh.
+    if (!isFinite(video.duration) || video.duration === 0) {
+      await new Promise<void>((resolve) => {
+        const onUpdate = () => {
+          if (isFinite(video.duration) && video.duration > 0) {
+            video.removeEventListener("timeupdate", onUpdate);
+            video.currentTime = 0;
+            resolve();
+          }
+        };
+        video.addEventListener("timeupdate", onUpdate);
+        video.currentTime = 1e9;
+        setTimeout(resolve, 3000);
+      });
+    }
+
+    const duration = video.duration;
+    if (!duration || !isFinite(duration) || duration < 0.5) {
+      URL.revokeObjectURL(url);
+      throw new Error("Video invalide ou trop courte");
+    }
+
+    const W = video.videoWidth;
+    const H = video.videoHeight;
+    if (!W || !H) {
+      URL.revokeObjectURL(url);
+      throw new Error("Resolution video invalide");
+    }
+    const scale = Math.min(1, maxDim / Math.max(W, H));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(W * scale);
+    canvas.height = Math.round(H * scale);
+    const ctx = canvas.getContext("2d")!;
+
+    const frames: File[] = [];
+    for (let i = 0; i < count; i++) {
+      const t = (i / Math.max(1, count - 1)) * duration * 0.999;
+      await new Promise<void>((resolve) => {
+        const onSeeked = () => {
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        };
+        video.addEventListener("seeked", onSeeked);
+        video.currentTime = t;
+        setTimeout(() => {
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        }, 3000);
+      });
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob(resolve, "image/jpeg", quality);
+      });
+      if (blob) frames.push(new File([blob], `frame_${i}.jpg`, { type: "image/jpeg" }));
+      onProgress?.(i + 1, count);
+    }
+
+    URL.revokeObjectURL(url);
+    return frames;
+  };
+
   const compressImage = async (file: File, maxDim = 1280, quality = 0.85): Promise<File> => {
     // createImageBitmap with imageOrientation respects EXIF rotation (avoids sideways photos from phones)
     const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
@@ -100,7 +181,8 @@ export default function Home() {
     setStatus("analyzing");
     setError("");
     setUploadPct(0);
-    setAnalyzePhase("upload");
+    setExtractPct(0);
+    setAnalyzePhase(mode === "premium" ? "extract" : "upload");
 
     const MODAL_URL = process.env.NEXT_PUBLIC_MODAL_API_URL;
     console.log("[Body Scan] handleAnalyze start", { mode, MODAL_URL });
@@ -131,9 +213,22 @@ export default function Home() {
         formData.append("photo_right", compressed.right);
         uploadBytes = compressed.front.size + compressed.left.size + compressed.back.size + compressed.right.size;
       } else if (mode === "premium" && video) {
-        endpoint = `${MODAL_URL}/analyze_video`;
-        formData.append("video", video.file);
-        uploadBytes = video.file.size;
+        endpoint = `${MODAL_URL}/analyze_video_frames`;
+        const N_FRAMES = 32;
+        console.log(`[Body Scan] Extracting ${N_FRAMES} frames from video (${(video.file.size / (1024 * 1024)).toFixed(1)} MB source)...`);
+        const t_extract = performance.now();
+        const frames = await extractVideoFrames(video.file, N_FRAMES, (i, total) => {
+          setExtractPct(Math.round((i / total) * 100));
+          if (i % 8 === 0) {
+            console.log(`[Body Scan] Extracted ${i}/${total} frames`);
+          }
+        });
+        console.log(`[Body Scan] Extracted ${frames.length} frames in ${((performance.now() - t_extract) / 1000).toFixed(1)}s`);
+        for (const f of frames) {
+          formData.append("frames", f, f.name);
+          uploadBytes += f.size;
+        }
+        setAnalyzePhase("upload");
       } else {
         throw new Error("Donnees manquantes");
       }
@@ -398,10 +493,23 @@ export default function Home() {
                 <div className="scan-line absolute left-0 w-full h-0.5 bg-[var(--accent)] shadow-[0_0_12px_var(--accent),0_0_24px_var(--accent)]" />
               </div>
             )}
-            {analyzePhase === "upload" ? (
+            {analyzePhase === "extract" ? (
               <>
                 <p className="text-sm text-[var(--foreground)]/60">
-                  Envoi de la {mode === "premium" ? "vidéo" : "photo"} au serveur...
+                  Extraction des images depuis la vidéo...
+                </p>
+                <div className="w-full bg-[var(--surface)] rounded-full h-2 overflow-hidden">
+                  <div
+                    className="h-2 bg-[var(--accent)] transition-all"
+                    style={{ width: `${extractPct}%` }}
+                  />
+                </div>
+                <p className="text-xs text-[var(--foreground)]/40">{extractPct}%</p>
+              </>
+            ) : analyzePhase === "upload" ? (
+              <>
+                <p className="text-sm text-[var(--foreground)]/60">
+                  Envoi des images au serveur...
                 </p>
                 <div className="w-full bg-[var(--surface)] rounded-full h-2 overflow-hidden">
                   <div
@@ -417,7 +525,7 @@ export default function Home() {
                   Reconstruction 3D multi-vue en cours...
                 </p>
                 <p className="text-xs text-[var(--foreground)]/40">
-                  {mode === "premium" ? "Cela peut prendre 2-5 minutes" : "Cela peut prendre 30-60 secondes"}
+                  {mode === "premium" ? "Cela peut prendre 1-3 minutes" : "Cela peut prendre 30-60 secondes"}
                 </p>
               </>
             )}

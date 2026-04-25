@@ -1411,18 +1411,71 @@ class BodyScanner:
         return self._do_analyze(photos, height_cm)
 
     @modal.method()
+    def _select_frames_from_jpegs(self, jpegs, n_frames=16):
+        """
+        Score candidate JPEGs (blur + MediaPipe pose), estimate rotation angles,
+        bucket into n_frames angular bins, keep the sharpest per bin.
+        Returns sorted list [(angle_deg, jpeg_bytes), ...] or {"error": str}.
+        """
+        if len(jpegs) < 4:
+            return {"error": "Pas assez de frames candidates"}
+
+        print(f"Scoring {len(jpegs)} candidates (blur + pose)...")
+        scored = []
+        for jpeg in jpegs:
+            blur = self._blur_score(jpeg)
+            pose = self._pose_full(jpeg, model_complexity=1)
+            if pose is None:
+                continue
+            angle = self._estimate_orientation_deg(pose["lm_3d"])
+            scored.append({"jpeg": jpeg, "blur": blur, "angle": angle})
+
+        if len(scored) < 4:
+            return {"error": "Pose detectee sur trop peu de frames"}
+
+        blurs = sorted(s["blur"] for s in scored)
+        blur_floor = max(blurs[len(blurs) // 4] * 0.6, 30.0)
+        scored = [s for s in scored if s["blur"] >= blur_floor]
+        if len(scored) < 4:
+            return {"error": "Trop peu de frames nettes"}
+        print(f"Pose+sharp on {len(scored)}/{len(jpegs)} candidates "
+              f"(blur floor={blur_floor:.0f})")
+
+        buckets = [[] for _ in range(n_frames)]
+        for s in scored:
+            bi = int(s["angle"] / 360.0 * n_frames) % n_frames
+            buckets[bi].append(s)
+        selected = []
+        for bucket in buckets:
+            if not bucket:
+                continue
+            best = max(bucket, key=lambda x: x["blur"])
+            selected.append((best["angle"], best["jpeg"]))
+        selected.sort(key=lambda x: x[0])
+
+        covered = len(selected)
+        angles_str = ",".join(f"{a:.0f}" for a, _ in selected)
+        print(f"Selected {covered}/{n_frames} frames covering angles: [{angles_str}]")
+        if covered < 4:
+            return {"error": f"Couverture angulaire insuffisante ({covered} vues)"}
+        return selected
+
+    def analyze_frames(self, jpegs, height_cm: float = 170.0, n_frames: int = 16):
+        """
+        Pre-extracted-frames variant: takes JPEG frames already pulled from the
+        video by the client (saves bandwidth vs uploading the whole video).
+        """
+        selected = self._select_frames_from_jpegs(jpegs, n_frames=n_frames)
+        if isinstance(selected, dict) and "error" in selected:
+            return selected
+        return self._do_analyze_video(selected, height_cm)
+
     def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0,
                       n_frames: int = 16, n_candidates: int = 32):
         """
-        Video-based multi-view reconstruction with robust angle estimation:
-        1. Extract n_candidates frames evenly from video
-        2. For each: blur score (Laplacian) + MediaPipe pose (2D+3D world landmarks)
-        3. Drop blurry frames and frames where pose was not detected
-        4. Compute real rotation angle per frame from world landmarks (hip->nose vector)
-        5. Bucket frames into n_frames angular bins, keep sharpest per bin
-        6. Voxel visual hull + marching cubes + Taubin smoothing
-        7. Multi-view UV texture projection
-        8. Measurements
+        Video-based multi-view reconstruction with robust angle estimation.
+        Extracts n_candidates JPEGs from the video then delegates to the same
+        scoring/selection/pipeline as analyze_frames.
         """
         import tempfile, os, subprocess, cv2, numpy as np
 
@@ -1446,64 +1499,22 @@ class BodyScanner:
 
             print(f"Extracting {n_candidates} candidate frames from {total} total...")
             indices = np.linspace(0, total - 1, n_candidates).astype(int)
-            candidates = []  # list of dicts {jpeg, blur, pose, t_idx}
-            for t_idx, idx in enumerate(indices):
+            jpegs = []
+            for idx in indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
                 ok, frame = cap.read()
                 if not ok:
                     continue
                 _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                jpeg = buf.tobytes()
-                candidates.append({"jpeg": jpeg, "t_idx": int(t_idx)})
+                jpegs.append(buf.tobytes())
             cap.release()
 
-            if len(candidates) < 4:
+            if len(jpegs) < 4:
                 return {"error": "Impossible d'extraire assez de frames"}
 
-            print(f"Scoring {len(candidates)} candidates (blur + pose)...")
-            scored = []
-            for c in candidates:
-                blur = self._blur_score(c["jpeg"])
-                pose = self._pose_full(c["jpeg"], model_complexity=1)
-                if pose is None:
-                    continue
-                angle = self._estimate_orientation_deg(pose["lm_3d"])
-                scored.append({
-                    "jpeg": c["jpeg"], "blur": blur,
-                    "angle": angle, "t_idx": c["t_idx"],
-                })
-
-            if len(scored) < 4:
-                return {"error": "Pose detectee sur trop peu de frames"}
-
-            blurs = sorted(s["blur"] for s in scored)
-            blur_floor = max(blurs[len(blurs) // 4] * 0.6, 30.0)
-            scored = [s for s in scored if s["blur"] >= blur_floor]
-            if len(scored) < 4:
-                return {"error": "Trop peu de frames nettes"}
-
-            print(f"Pose+sharp on {len(scored)}/{len(candidates)} candidates "
-                  f"(blur floor={blur_floor:.0f})")
-
-            buckets = [[] for _ in range(n_frames)]
-            for s in scored:
-                bi = int(s["angle"] / 360.0 * n_frames) % n_frames
-                buckets[bi].append(s)
-            selected = []
-            for bi, bucket in enumerate(buckets):
-                if not bucket:
-                    continue
-                best = max(bucket, key=lambda x: x["blur"])
-                selected.append((best["angle"], best["jpeg"]))
-            selected.sort(key=lambda x: x[0])
-
-            covered = len(selected)
-            angles_str = ",".join(f"{a:.0f}" for a, _ in selected)
-            print(f"Selected {covered}/{n_frames} frames covering angles: [{angles_str}]")
-
-            if covered < 4:
-                return {"error": f"Couverture angulaire insuffisante ({covered} vues)"}
-
+            selected = self._select_frames_from_jpegs(jpegs, n_frames=n_frames)
+            if isinstance(selected, dict) and "error" in selected:
+                return selected
             return self._do_analyze_video(selected, height_cm)
         finally:
             for p in (raw, mp4):
@@ -1832,6 +1843,25 @@ async def analyze_video(video: UploadFile = File(...), height_cm: float = Form(1
     video_bytes = await video.read()
     scanner = BodyScanner()
     result = scanner.analyze_video.remote(video_bytes, height_cm)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@web_app.post("/analyze_video_frames")
+async def analyze_video_frames(
+    frames: list[UploadFile] = File(...),
+    height_cm: float = Form(170.0),
+):
+    """
+    Same pipeline as /analyze_video but receives pre-extracted JPEG frames from
+    the client (saves uploading the whole video, ~10x smaller payload).
+    """
+    if len(frames) < 4:
+        raise HTTPException(status_code=400, detail="Au moins 4 frames requises")
+    jpegs = [await f.read() for f in frames]
+    scanner = BodyScanner()
+    result = scanner.analyze_frames.remote(jpegs, height_cm)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result

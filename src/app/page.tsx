@@ -239,10 +239,11 @@ export default function Home() {
       });
       const t0 = performance.now();
 
-      const data: AnalysisResult = await new Promise((resolve, reject) => {
+      // Upload via XHR to get progress events
+      const uploadResponseText: string = await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", endpoint);
-        xhr.timeout = 12 * 60 * 1000;
+        xhr.timeout = 5 * 60 * 1000;
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable) {
             const pct = Math.round((e.loaded / e.total) * 100);
@@ -253,19 +254,15 @@ export default function Home() {
           }
         };
         xhr.upload.onload = () => {
-          console.log(`[Body Scan] Upload finished in ${((performance.now() - t0) / 1000).toFixed(1)}s, waiting for Modal...`);
+          console.log(`[Body Scan] Upload finished in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
           setAnalyzePhase("processing");
         };
-        xhr.onerror = () => reject(new Error("Erreur reseau"));
-        xhr.ontimeout = () => reject(new Error("Timeout (>12 min) - le serveur met trop longtemps a repondre"));
+        xhr.onerror = () => reject(new Error("Erreur reseau pendant l'upload"));
+        xhr.ontimeout = () => reject(new Error("Timeout upload (>5 min)"));
         xhr.onload = () => {
-          console.log(`[Body Scan] Modal responded in ${((performance.now() - t0) / 1000).toFixed(1)}s with status ${xhr.status}`);
+          console.log(`[Body Scan] Upload response status ${xhr.status} after ${((performance.now() - t0) / 1000).toFixed(1)}s`);
           if (xhr.status >= 200 && xhr.status < 300) {
-            try {
-              resolve(JSON.parse(xhr.responseText));
-            } catch {
-              reject(new Error("Reponse JSON invalide"));
-            }
+            resolve(xhr.responseText);
           } else {
             let detail = `Erreur ${xhr.status}`;
             try {
@@ -277,6 +274,61 @@ export default function Home() {
         };
         xhr.send(formData);
       });
+
+      // For premium video flow, the upload returns a job_id and we poll.
+      // For standard 4-photo flow, the upload returns the full result directly.
+      let data: AnalysisResult;
+      if (mode === "premium") {
+        const submit = JSON.parse(uploadResponseText);
+        if (!submit.job_id) {
+          throw new Error("Reponse submit invalide (job_id manquant)");
+        }
+        console.log(`[Body Scan] Submitted, polling job ${submit.job_id}...`);
+
+        const POLL_INTERVAL_MS = 3000;
+        const MAX_POLL_MS = 12 * 60 * 1000;
+        const t_poll0 = performance.now();
+        let lastLog = 0;
+        while (true) {
+          if (performance.now() - t_poll0 > MAX_POLL_MS) {
+            throw new Error("Timeout (>12 min) - le serveur met trop longtemps");
+          }
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+          let pollData: { status: string; result?: AnalysisResult; detail?: string };
+          try {
+            const pollResp = await fetch(`${MODAL_URL}/job/${submit.job_id}`, { cache: "no-store" });
+            if (!pollResp.ok) {
+              const txt = await pollResp.text().catch(() => "");
+              throw new Error(`Erreur poll ${pollResp.status}: ${txt.slice(0, 200)}`);
+            }
+            pollData = await pollResp.json();
+          } catch (e) {
+            console.warn("[Body Scan] Poll request failed (will retry):", e);
+            continue;
+          }
+          const elapsed = ((performance.now() - t_poll0) / 1000).toFixed(0);
+          if (pollData.status === "done" && pollData.result) {
+            console.log(`[Body Scan] Job done after ${elapsed}s polling`);
+            data = pollData.result;
+            break;
+          } else if (pollData.status === "error") {
+            throw new Error(pollData.detail || "Erreur backend");
+          } else if (pollData.status === "expired") {
+            throw new Error("Job expire (resultat non disponible)");
+          } else {
+            if (Date.now() - lastLog > 15000) {
+              console.log(`[Body Scan] Job ${submit.job_id}: ${pollData.status} (${elapsed}s elapsed)`);
+              lastLog = Date.now();
+            }
+          }
+        }
+      } else {
+        try {
+          data = JSON.parse(uploadResponseText);
+        } catch {
+          throw new Error("Reponse JSON invalide");
+        }
+      }
 
       console.log("[Body Scan] Result:", {
         hasMeasurements: !!data.measurements,

@@ -1948,17 +1948,37 @@ async def analyze_video_frames(
     height_cm: float = Form(170.0),
 ):
     """
-    Same pipeline as /analyze_video but receives pre-extracted JPEG frames from
-    the client (saves uploading the whole video, ~10x smaller payload).
+    Submit endpoint: spawns the analysis as a background task and returns a
+    job_id immediately. Client polls /job/{job_id} for progress and result.
+    This pattern survives mobile NAT idle timeouts and proxy connection drops
+    that would otherwise kill a 2-3 min synchronous request.
     """
     if len(frames) < 4:
         raise HTTPException(status_code=400, detail="Au moins 4 frames requises")
     jpegs = [await f.read() for f in frames]
     scanner = BodyScanner()
-    result = scanner.analyze_frames.remote(jpegs, height_cm)
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
+    call = scanner.analyze_frames.spawn(jpegs, height_cm)
+    return {"job_id": call.object_id}
+
+
+@web_app.get("/job/{job_id}")
+async def get_job(job_id: str):
+    """Poll endpoint. Returns {status: pending|done|error, ...}."""
+    try:
+        fc = modal.FunctionCall.from_id(job_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="job_id inconnu")
+    try:
+        result = fc.get(timeout=0)
+    except TimeoutError:
+        return {"status": "pending"}
+    except modal.exception.OutputExpiredError:
+        return {"status": "expired"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+    if isinstance(result, dict) and "error" in result:
+        return {"status": "error", "detail": result["error"]}
+    return {"status": "done", "result": result}
 
 
 @app.function(image=image, timeout=900)

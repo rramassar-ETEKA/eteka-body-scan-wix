@@ -1447,26 +1447,42 @@ class BodyScanner:
 
     def _select_frames_from_jpegs(self, jpegs, n_frames=16):
         """
-        Score candidate JPEGs (blur + MediaPipe pose), estimate rotation angles,
-        bucket into n_frames angular bins, keep the sharpest per bin.
-        Returns sorted list [(angle_deg, jpeg_bytes), ...] or {"error": str}.
+        Score candidate JPEGs and assign each a rotation angle [0, 360) using
+        a temporally-anchored method:
+
+        1. Per frame: extract blur, MediaPipe shoulder signed dx, hip x.
+        2. The signed shoulder distance (left_shoulder.x - right_shoulder.x in
+           pixels) varies as ~cos(theta) * shoulder_width:
+             - max at theta=0 (front, subject's left arm visible at viewer's right)
+             - 0 at profile
+             - min (negative) at theta=180 (back, arms swapped in image)
+        3. Find the t_idx where shoulder_dx is max (= front anchor) and min
+           (= back anchor). These are 180 deg apart in time.
+        4. Assume rotation is monotonic in time, so the full rotation period
+           T_full = 2 * |t_back - t_front|. Map each frame's t_idx to angle:
+                   angle(t) = ((t - t_front) / T_full * 360) mod 360
+        5. Bucket frames into n_frames angular bins, keep the sharpest per bin.
+
+        Returns sorted list [(angle_deg, jpeg_bytes, hip_px_x), ...] or {"error": str}.
         """
         if len(jpegs) < 4:
             return {"error": "Pas assez de frames candidates"}
 
         print(f"Scoring {len(jpegs)} candidates (blur + pose)...")
         scored = []
-        for jpeg in jpegs:
+        for t_idx, jpeg in enumerate(jpegs):
             blur = self._blur_score(jpeg)
             pose = self._pose_full(jpeg, model_complexity=1)
             if pose is None:
                 continue
-            angle = self._estimate_orientation_deg(pose["lm_2d"])
-            # Hip x in pixel coords for later silhouette recentering
-            hip_px_x = (pose["lm_2d"][23]["x"] + pose["lm_2d"][24]["x"]) / 2.0
+            lm = pose["lm_2d"]
+            shoulder_dx = float(lm[11]["x"] - lm[12]["x"])  # signed pixels
+            hip_px_x = float((lm[23]["x"] + lm[24]["x"]) / 2.0)
             scored.append({
-                "jpeg": jpeg, "blur": blur, "angle": angle,
-                "hip_px_x": float(hip_px_x), "img_w": pose["img_size"][0],
+                "jpeg": jpeg, "blur": blur,
+                "shoulder_dx": shoulder_dx,
+                "hip_px_x": hip_px_x,
+                "t_idx": int(t_idx),
             })
 
         if len(scored) < 4:
@@ -1479,6 +1495,29 @@ class BodyScanner:
             return {"error": "Trop peu de frames nettes"}
         print(f"Pose+sharp on {len(scored)}/{len(jpegs)} candidates "
               f"(blur floor={blur_floor:.0f})")
+
+        # Temporal anchor on front (max shoulder_dx) and back (min shoulder_dx)
+        front_anchor = max(scored, key=lambda s: s["shoulder_dx"])
+        back_anchor = min(scored, key=lambda s: s["shoulder_dx"])
+        t_front = front_anchor["t_idx"]
+        t_back = back_anchor["t_idx"]
+        half_period = abs(t_back - t_front)
+        if half_period < 2:
+            return {"error": "Rotation insuffisante (front et back trop proches dans le temps)"}
+        # Sanity: front should have positive shoulder_dx, back negative
+        if front_anchor["shoulder_dx"] <= 0 or back_anchor["shoulder_dx"] >= 0:
+            print(f"WARNING: shoulder_dx range [{back_anchor['shoulder_dx']:.0f}..{front_anchor['shoulder_dx']:.0f}] "
+                  f"does not span both signs - rotation may be incomplete")
+
+        T_full = 2 * half_period
+        print(f"Anchors: t_front={t_front} (shoulder_dx={front_anchor['shoulder_dx']:.0f}px), "
+              f"t_back={t_back} (shoulder_dx={back_anchor['shoulder_dx']:.0f}px), "
+              f"period={T_full} frame-units")
+
+        for s in scored:
+            angle = ((s["t_idx"] - t_front) / T_full) * 360.0
+            angle = angle % 360.0
+            s["angle"] = angle
 
         buckets = [[] for _ in range(n_frames)]
         for s in scored:

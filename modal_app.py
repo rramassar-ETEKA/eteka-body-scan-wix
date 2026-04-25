@@ -1460,6 +1460,7 @@ class BodyScanner:
             return {"error": f"Couverture angulaire insuffisante ({covered} vues)"}
         return selected
 
+    @modal.method()
     def analyze_frames(self, jpegs, height_cm: float = 170.0, n_frames: int = 16):
         """
         Pre-extracted-frames variant: takes JPEG frames already pulled from the

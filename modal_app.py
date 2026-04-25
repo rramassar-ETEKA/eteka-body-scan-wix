@@ -1410,7 +1410,6 @@ class BodyScanner:
     def analyze_multiview(self, photos: dict, height_cm: float = 170.0):
         return self._do_analyze(photos, height_cm)
 
-    @modal.method()
     def _select_frames_from_jpegs(self, jpegs, n_frames=16):
         """
         Score candidate JPEGs (blur + MediaPipe pose), estimate rotation angles,
@@ -1471,6 +1470,7 @@ class BodyScanner:
             return selected
         return self._do_analyze_video(selected, height_cm)
 
+    @modal.method()
     def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0,
                       n_frames: int = 16, n_candidates: int = 32):
         """

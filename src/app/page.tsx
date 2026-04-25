@@ -40,6 +40,7 @@ export default function Home() {
   const [embedMode, setEmbedMode] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [extractPct, setExtractPct] = useState(0);
+  const [pollSec, setPollSec] = useState(0);
   const [analyzePhase, setAnalyzePhase] = useState<"extract" | "upload" | "processing">("upload");
   const mainRef = useRef<HTMLDivElement>(null);
 
@@ -177,6 +178,80 @@ export default function Home() {
     });
   };
 
+  const pollJob = async (
+    modalUrl: string,
+    jobId: string,
+    onElapsed?: (sec: number) => void,
+  ): Promise<AnalysisResult> => {
+    const POLL_INTERVAL_MS = 3000;
+    const MAX_POLL_MS = 12 * 60 * 1000;
+    const t0 = Date.now();
+    let pollCount = 0;
+    while (true) {
+      const elapsedMs = Date.now() - t0;
+      if (elapsedMs > MAX_POLL_MS) {
+        throw new Error("Timeout (>12 min) - le serveur met trop longtemps");
+      }
+      onElapsed?.(Math.round(elapsedMs / 1000));
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      pollCount++;
+      try {
+        const resp = await fetch(`${modalUrl}/job/${jobId}`, { cache: "no-store" });
+        if (!resp.ok) {
+          console.warn(`[Body Scan] Poll ${pollCount} HTTP ${resp.status}, retrying`);
+          continue;
+        }
+        const pd = await resp.json();
+        const elapsedSec = Math.round((Date.now() - t0) / 1000);
+        console.log(`[Body Scan] Poll ${pollCount} @ ${elapsedSec}s -> ${pd.status}`);
+        if (pd.status === "done" && pd.result) {
+          return pd.result;
+        }
+        if (pd.status === "error") {
+          throw new Error(pd.detail || "Erreur backend");
+        }
+        if (pd.status === "expired") {
+          throw new Error("Resultat expire");
+        }
+      } catch (e) {
+        if (e instanceof Error && (e.message.startsWith("Erreur backend") || e.message.startsWith("Resultat expire") || e.message.startsWith("Timeout"))) {
+          throw e;
+        }
+        console.warn(`[Body Scan] Poll ${pollCount} network error (will retry):`, e);
+      }
+    }
+  };
+
+  // Resume polling on page reload if a job is pending in sessionStorage
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let pending: { jobId: string; modalUrl: string; ts: number } | null = null;
+    try {
+      const raw = sessionStorage.getItem("eteka_pending_job");
+      if (raw) pending = JSON.parse(raw);
+    } catch {}
+    if (!pending || !pending.jobId) return;
+    if (Date.now() - pending.ts > 15 * 60 * 1000) {
+      sessionStorage.removeItem("eteka_pending_job");
+      return;
+    }
+    console.log(`[Body Scan] Resuming poll for job ${pending.jobId} (started ${Math.round((Date.now() - pending.ts) / 1000)}s ago)`);
+    setStatus("analyzing");
+    setMode("premium");
+    setAnalyzePhase("processing");
+    pollJob(pending.modalUrl, pending.jobId, setPollSec)
+      .then((d: AnalysisResult) => {
+        setResult(d);
+        setStatus("done");
+        try { sessionStorage.removeItem("eteka_pending_job"); } catch {}
+      })
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : "Erreur inconnue");
+        setStatus("error");
+        try { sessionStorage.removeItem("eteka_pending_job"); } catch {}
+      });
+  }, []);
+
   const handleAnalyze = async () => {
     setStatus("analyzing");
     setError("");
@@ -283,45 +358,14 @@ export default function Home() {
         if (!submit.job_id) {
           throw new Error("Reponse submit invalide (job_id manquant)");
         }
-        console.log(`[Body Scan] Submitted, polling job ${submit.job_id}...`);
+        const jobId: string = submit.job_id;
+        try {
+          sessionStorage.setItem("eteka_pending_job", JSON.stringify({ jobId, modalUrl: MODAL_URL, ts: Date.now() }));
+        } catch {}
+        console.log(`[Body Scan] Submitted, polling job ${jobId}...`);
 
-        const POLL_INTERVAL_MS = 3000;
-        const MAX_POLL_MS = 12 * 60 * 1000;
-        const t_poll0 = performance.now();
-        let lastLog = 0;
-        while (true) {
-          if (performance.now() - t_poll0 > MAX_POLL_MS) {
-            throw new Error("Timeout (>12 min) - le serveur met trop longtemps");
-          }
-          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-          let pollData: { status: string; result?: AnalysisResult; detail?: string };
-          try {
-            const pollResp = await fetch(`${MODAL_URL}/job/${submit.job_id}`, { cache: "no-store" });
-            if (!pollResp.ok) {
-              const txt = await pollResp.text().catch(() => "");
-              throw new Error(`Erreur poll ${pollResp.status}: ${txt.slice(0, 200)}`);
-            }
-            pollData = await pollResp.json();
-          } catch (e) {
-            console.warn("[Body Scan] Poll request failed (will retry):", e);
-            continue;
-          }
-          const elapsed = ((performance.now() - t_poll0) / 1000).toFixed(0);
-          if (pollData.status === "done" && pollData.result) {
-            console.log(`[Body Scan] Job done after ${elapsed}s polling`);
-            data = pollData.result;
-            break;
-          } else if (pollData.status === "error") {
-            throw new Error(pollData.detail || "Erreur backend");
-          } else if (pollData.status === "expired") {
-            throw new Error("Job expire (resultat non disponible)");
-          } else {
-            if (Date.now() - lastLog > 15000) {
-              console.log(`[Body Scan] Job ${submit.job_id}: ${pollData.status} (${elapsed}s elapsed)`);
-              lastLog = Date.now();
-            }
-          }
-        }
+        data = await pollJob(MODAL_URL, jobId, setPollSec);
+        try { sessionStorage.removeItem("eteka_pending_job"); } catch {}
       } else {
         try {
           data = JSON.parse(uploadResponseText);
@@ -577,8 +621,13 @@ export default function Home() {
                 <p className="text-sm text-[var(--foreground)]/60">
                   Reconstruction 3D multi-vue en cours...
                 </p>
+                {mode === "premium" && pollSec > 0 && (
+                  <p className="text-sm text-[var(--accent)] font-mono">
+                    {Math.floor(pollSec / 60)}min {pollSec % 60}s
+                  </p>
+                )}
                 <p className="text-xs text-[var(--foreground)]/40">
-                  {mode === "premium" ? "Cela peut prendre 1-3 minutes" : "Cela peut prendre 30-60 secondes"}
+                  {mode === "premium" ? "1-3 min. Garde l'onglet ouvert et au premier plan." : "Cela peut prendre 30-60 secondes"}
                 </p>
               </>
             )}

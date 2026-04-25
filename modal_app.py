@@ -1601,12 +1601,15 @@ class BodyScanner:
                 try: os.unlink(p)
                 except: pass
 
-    def _do_analyze_video(self, frames, height_cm):
+    def _do_analyze_video(self, frames, height_cm, enable_texture: bool = False):
         """
         Process N frames (angle, jpeg_bytes, hip_px_x) from rotating video.
         Each frame is a different angle (0..360 deg).
         Silhouettes are recentered horizontally on the MediaPipe hip x position
         so the visual hull rotation axis matches the actual body axis.
+
+        Texture mapping (~60-90s) is skipped by default - mesh + measurements
+        are the priority. Set enable_texture=True to compute UV atlas.
         """
         import numpy as np
 
@@ -1659,17 +1662,20 @@ class BodyScanner:
             hull_mesh, kp_snapped, height_cm, silhouettes=silhouettes_dict
         )
 
-        # Multi-view UV texture mapping (optional - mesh + measurements are the priority)
+        # Multi-view UV texture mapping (skipped by default - saves ~60-90s)
         uvs = None
         texture_b64 = None
-        try:
-            print("Applying multi-view UV texture...")
-            tex_frames = [(a, j) for a, j, _ in frames]
-            uvs, texture_b64 = self._apply_uv_texture_multiview(hull_mesh, tex_frames)
-        except Exception as e:
-            print(f"UV texture failed: {e}")
-            import traceback
-            traceback.print_exc()
+        if enable_texture:
+            try:
+                print("Applying multi-view UV texture...")
+                tex_frames = [(a, j) for a, j, _ in frames]
+                uvs, texture_b64 = self._apply_uv_texture_multiview(hull_mesh, tex_frames)
+            except Exception as e:
+                print(f"UV texture failed: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Skipping UV texture (enable_texture=False, saves ~60-90s)")
 
         return {
             "success": True,
@@ -1955,7 +1961,7 @@ async def analyze_video_frames(
     return result
 
 
-@app.function(image=image)
+@app.function(image=image, timeout=900)
 @modal.asgi_app()
 def fastapi_app():
     return web_app

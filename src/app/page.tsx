@@ -242,6 +242,7 @@ export default function Home() {
       const data: AnalysisResult = await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", endpoint);
+        xhr.timeout = 12 * 60 * 1000;
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable) {
             const pct = Math.round((e.loaded / e.total) * 100);
@@ -256,7 +257,7 @@ export default function Home() {
           setAnalyzePhase("processing");
         };
         xhr.onerror = () => reject(new Error("Erreur reseau"));
-        xhr.ontimeout = () => reject(new Error("Timeout"));
+        xhr.ontimeout = () => reject(new Error("Timeout (>12 min) - le serveur met trop longtemps a repondre"));
         xhr.onload = () => {
           console.log(`[Body Scan] Modal responded in ${((performance.now() - t0) / 1000).toFixed(1)}s with status ${xhr.status}`);
           if (xhr.status >= 200 && xhr.status < 300) {

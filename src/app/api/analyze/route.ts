@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const MODAL_API_URL = process.env.MODAL_API_URL || "";
+const MODAL_API_URL = process.env.NEXT_PUBLIC_MODAL_API_URL || process.env.MODAL_API_URL || "";
 
 export async function POST(request: NextRequest) {
   try {

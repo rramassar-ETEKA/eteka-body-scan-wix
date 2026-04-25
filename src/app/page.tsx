@@ -23,6 +23,8 @@ interface AnalysisResult {
   faces?: number[][];
   keypoints_3d?: Record<string, number[]>;
   slices?: Record<string, SliceData>;
+  uvs?: number[][];
+  texture_b64?: string;
 }
 
 export default function Home() {
@@ -36,6 +38,8 @@ export default function Home() {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string>("");
   const [embedMode, setEmbedMode] = useState(false);
+  const [uploadPct, setUploadPct] = useState(0);
+  const [analyzePhase, setAnalyzePhase] = useState<"upload" | "processing">("upload");
   const mainRef = useRef<HTMLDivElement>(null);
 
   // Detect embed mode from URL param
@@ -95,8 +99,11 @@ export default function Home() {
   const handleAnalyze = async () => {
     setStatus("analyzing");
     setError("");
+    setUploadPct(0);
+    setAnalyzePhase("upload");
 
     const MODAL_URL = process.env.NEXT_PUBLIC_MODAL_API_URL;
+    console.log("[Body Scan] handleAnalyze start", { mode, MODAL_URL });
     if (!MODAL_URL) {
       setError("Configuration manquante: NEXT_PUBLIC_MODAL_API_URL");
       setStatus("error");
@@ -108,6 +115,7 @@ export default function Home() {
       formData.append("height_cm", height.toString());
 
       let endpoint = "";
+      let uploadBytes = 0;
 
       if (mode === "standard" && photos) {
         endpoint = `${MODAL_URL}/analyze_multiview`;
@@ -121,20 +129,59 @@ export default function Home() {
         formData.append("photo_left", compressed.left);
         formData.append("photo_back", compressed.back);
         formData.append("photo_right", compressed.right);
+        uploadBytes = compressed.front.size + compressed.left.size + compressed.back.size + compressed.right.size;
       } else if (mode === "premium" && video) {
         endpoint = `${MODAL_URL}/analyze_video`;
         formData.append("video", video.file);
+        uploadBytes = video.file.size;
       } else {
         throw new Error("Donnees manquantes");
       }
 
-      const res = await fetch(endpoint, { method: "POST", body: formData });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `Erreur ${res.status}`);
-      }
+      console.log("[Body Scan] Uploading", {
+        endpoint,
+        sizeMB: (uploadBytes / (1024 * 1024)).toFixed(2),
+      });
+      const t0 = performance.now();
 
-      const data = await res.json();
+      const data: AnalysisResult = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", endpoint);
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            setUploadPct(pct);
+            if (pct % 10 === 0) {
+              console.log(`[Body Scan] Upload ${pct}% (${(e.loaded / (1024 * 1024)).toFixed(1)}/${(e.total / (1024 * 1024)).toFixed(1)} MB)`);
+            }
+          }
+        };
+        xhr.upload.onload = () => {
+          console.log(`[Body Scan] Upload finished in ${((performance.now() - t0) / 1000).toFixed(1)}s, waiting for Modal...`);
+          setAnalyzePhase("processing");
+        };
+        xhr.onerror = () => reject(new Error("Erreur reseau"));
+        xhr.ontimeout = () => reject(new Error("Timeout"));
+        xhr.onload = () => {
+          console.log(`[Body Scan] Modal responded in ${((performance.now() - t0) / 1000).toFixed(1)}s with status ${xhr.status}`);
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              resolve(JSON.parse(xhr.responseText));
+            } catch {
+              reject(new Error("Reponse JSON invalide"));
+            }
+          } else {
+            let detail = `Erreur ${xhr.status}`;
+            try {
+              const j = JSON.parse(xhr.responseText);
+              if (j.detail) detail = j.detail;
+            } catch {}
+            reject(new Error(detail));
+          }
+        };
+        xhr.send(formData);
+      });
+
       console.log("[Body Scan] Result:", {
         hasMeasurements: !!data.measurements,
         measurementKeys: data.measurements ? Object.keys(data.measurements) : [],
@@ -153,6 +200,7 @@ export default function Home() {
       setResult(data);
       setStatus("done");
     } catch (err) {
+      console.error("[Body Scan] Analyze failed:", err);
       setError(err instanceof Error ? err.message : "Erreur inconnue");
       setStatus("error");
     }
@@ -197,43 +245,25 @@ export default function Home() {
       <main ref={mainRef} className="flex-1 px-4 py-6 max-w-5xl mx-auto w-full">
         {/* Mode selection */}
         {status === "idle" && (
-          <div className="space-y-8">
-            <div className="text-center">
+          <div className="space-y-6 max-w-2xl mx-auto">
+            <div className="text-center space-y-2">
               <h2 className="text-2xl font-bold">Analysez votre morphologie</h2>
+              <p className="text-sm text-[var(--foreground)]/60">
+                Filmez-vous en 360&deg; pendant ~15 secondes pour une reconstruction 3D
+              </p>
             </div>
-
-            <div className="grid md:grid-cols-2 gap-4 max-w-3xl mx-auto">
-              <button
-                onClick={() => {
-                  setMode("standard");
-                  setStatus("instructions");
-                }}
-                className="glass rounded-2xl p-8 text-left hover:bg-[var(--surface-light)] transition-colors"
-              >
-                <h3 className="font-semibold text-[var(--primary-light)] text-lg mb-2">Mode Standard</h3>
-                <p className="text-sm text-[var(--foreground)]/60">
-                  4 photos : face, dos, profil gauche et droit
-                </p>
-              </button>
-
-              <button
-                onClick={() => {
-                  setMode("premium");
-                  setStatus("instructions");
-                }}
-                className="glass rounded-2xl p-8 text-left hover:bg-[var(--surface-light)] transition-colors border-2 border-[var(--accent)]/30"
-              >
-                <div className="flex items-start justify-between mb-2">
-                  <h3 className="font-semibold text-[var(--accent)] text-lg">Scan 360&deg;</h3>
-                  <span className="text-xs bg-[var(--accent)] text-black px-2 py-0.5 rounded-full font-semibold">
-                    PREMIUM
-                  </span>
-                </div>
-                <p className="text-sm text-[var(--foreground)]/60">
-                  Video 360&deg; pour une reconstruction detaillee
-                </p>
-              </button>
-            </div>
+            <button
+              onClick={() => {
+                setMode("premium");
+                setStatus("instructions");
+              }}
+              className="glass rounded-2xl p-8 w-full text-center hover:bg-[var(--surface-light)] transition-colors border-2 border-[var(--accent)]/30"
+            >
+              <h3 className="font-semibold text-[var(--accent)] text-xl mb-2">Commencer le scan</h3>
+              <p className="text-sm text-[var(--foreground)]/70">
+                Une vidéo 360&deg; de 15 secondes autour du corps
+              </p>
+            </button>
           </div>
         )}
 
@@ -353,16 +383,44 @@ export default function Home() {
           <div className="max-w-md mx-auto space-y-4 text-center">
             {previewUrl && (
               <div className="relative w-48 mx-auto rounded-xl overflow-hidden">
-                <img src={previewUrl} alt="Analyse" className="w-full object-contain rounded-xl opacity-70" />
+                {mode === "premium" ? (
+                  <video
+                    src={previewUrl}
+                    autoPlay
+                    loop
+                    muted
+                    playsInline
+                    className="w-full object-contain rounded-xl opacity-70"
+                  />
+                ) : (
+                  <img src={previewUrl} alt="Analyse" className="w-full object-contain rounded-xl opacity-70" />
+                )}
                 <div className="scan-line absolute left-0 w-full h-0.5 bg-[var(--accent)] shadow-[0_0_12px_var(--accent),0_0_24px_var(--accent)]" />
               </div>
             )}
-            <p className="text-sm text-[var(--foreground)]/60">
-              Reconstruction 3D multi-vue en cours...
-            </p>
-            <p className="text-xs text-[var(--foreground)]/40">
-              {mode === "premium" ? "Cela peut prendre 2-5 minutes" : "Cela peut prendre 30-60 secondes"}
-            </p>
+            {analyzePhase === "upload" ? (
+              <>
+                <p className="text-sm text-[var(--foreground)]/60">
+                  Envoi de la {mode === "premium" ? "vidéo" : "photo"} au serveur...
+                </p>
+                <div className="w-full bg-[var(--surface)] rounded-full h-2 overflow-hidden">
+                  <div
+                    className="h-2 bg-[var(--accent)] transition-all"
+                    style={{ width: `${uploadPct}%` }}
+                  />
+                </div>
+                <p className="text-xs text-[var(--foreground)]/40">{uploadPct}%</p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-[var(--foreground)]/60">
+                  Reconstruction 3D multi-vue en cours...
+                </p>
+                <p className="text-xs text-[var(--foreground)]/40">
+                  {mode === "premium" ? "Cela peut prendre 2-5 minutes" : "Cela peut prendre 30-60 secondes"}
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -383,6 +441,8 @@ export default function Home() {
                 measurements={result.measurements}
                 keypoints={result.keypoints_3d}
                 slices={result.slices}
+                uvs={result.uvs}
+                textureB64={result.texture_b64}
               />
             )}
 

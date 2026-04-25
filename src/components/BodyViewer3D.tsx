@@ -14,6 +14,8 @@ interface BodyViewer3DProps {
   measurements?: Record<string, number>;
   keypoints?: Record<string, number[]>;
   slices?: Record<string, SliceData>;
+  uvs?: number[][];
+  textureB64?: string;
 }
 
 const MEASUREMENT_LEVELS: Record<string, { yFraction: number; color: number }> = {
@@ -73,7 +75,7 @@ const SLICE_COLORS: Record<string, number> = {
   biceps: 0xf97316,
 };
 
-export default function BodyViewer3D({ vertices, faces, measurements, keypoints, slices }: BodyViewer3DProps) {
+export default function BodyViewer3D({ vertices, faces, measurements, keypoints, slices, uvs, textureB64 }: BodyViewer3DProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const keypointGroupRef = useRef<THREE.Group | null>(null);
@@ -126,6 +128,12 @@ export default function BodyViewer3D({ vertices, faces, measurements, keypoints,
     const vertArray = new Float32Array(vertices.flat());
     geometry.setAttribute("position", new THREE.BufferAttribute(vertArray, 3));
 
+    // UV attribute for texture mapping
+    if (uvs && uvs.length === vertices.length) {
+      const uvArray = new Float32Array(uvs.flat());
+      geometry.setAttribute("uv", new THREE.BufferAttribute(uvArray, 2));
+    }
+
     const indexArray = new Uint32Array(faces.flat());
     geometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
     geometry.computeVertexNormals();
@@ -138,12 +146,24 @@ export default function BodyViewer3D({ vertices, faces, measurements, keypoints,
 
     geometry.center();
 
-    const material = new THREE.MeshStandardMaterial({
-      color: 0xe2e8f0,
-      metalness: 0.1,
-      roughness: 0.6,
-      side: THREE.DoubleSide,
-    });
+    // Material: textured if UV+texture available, else neutral
+    let material: THREE.Material;
+    if (uvs && textureB64 && uvs.length === vertices.length) {
+      const tex = new THREE.TextureLoader().load(`data:image/jpeg;base64,${textureB64}`);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.flipY = false;
+      material = new THREE.MeshBasicMaterial({
+        map: tex,
+        side: THREE.DoubleSide,
+      });
+    } else {
+      material = new THREE.MeshStandardMaterial({
+        color: 0xe2e8f0,
+        metalness: 0.1,
+        roughness: 0.6,
+        side: THREE.DoubleSide,
+      });
+    }
 
     const bodyGroup = new THREE.Group();
     const mesh = new THREE.Mesh(geometry, material);

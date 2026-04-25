@@ -43,6 +43,7 @@ image = (
         "tqdm",
         "matplotlib",
         "mediapipe==0.10.14",
+        "fast-simplification",
     )
     .run_commands(
         "git clone https://github.com/facebookresearch/pifuhd.git /opt/pifuhd",
@@ -153,6 +154,80 @@ class BodyScanner:
             kp_norm[name] = {'u': float(u), 'v': float(v), 'z': float(lm.z)}
         return kp_norm
 
+    def _blur_score(self, image_bytes):
+        """Laplacian variance as sharpness proxy. Higher = sharper."""
+        import cv2
+        import numpy as np
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return 0.0
+        return float(cv2.Laplacian(img, cv2.CV_64F).var())
+
+    def _pose_full(self, image_bytes, model_complexity=1):
+        """
+        Run MediaPipe Pose, return image-space 2D landmarks + world-space 3D landmarks.
+        Returns dict with 'lm_2d' (33 list of dicts {x_px, y_px, vis}),
+        'lm_3d' (33 list of dicts {x, y, z}, hip-centered meters),
+        'img_size' (W, H), or None if no pose detected.
+        """
+        import mediapipe as mp
+        from PIL import Image
+        import numpy as np
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        W, H = img.size
+        img_np = np.array(img)
+
+        with self.mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=model_complexity,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+        ) as pose:
+            results = pose.process(img_np)
+
+        if not results.pose_landmarks or not results.pose_world_landmarks:
+            return None
+
+        lm_2d = [
+            {"x": float(lm.x * W), "y": float(lm.y * H), "vis": float(lm.visibility)}
+            for lm in results.pose_landmarks.landmark
+        ]
+        lm_3d = [
+            {"x": float(lm.x), "y": float(lm.y), "z": float(lm.z)}
+            for lm in results.pose_world_landmarks.landmark
+        ]
+        return {"lm_2d": lm_2d, "lm_3d": lm_3d, "img_size": (W, H)}
+
+    def _estimate_orientation_deg(self, lm_3d):
+        """
+        Estimate body rotation around the vertical (Y) axis from world landmarks.
+        Returns angle in [0, 360) where:
+          0   = facing camera
+          90  = subject turned 90 deg to their right (camera sees their right side)
+          180 = back to camera
+          270 = subject turned 90 deg to their left (camera sees their left side)
+
+        MediaPipe world landmarks: hip-centered meters. +X = subject's left (image
+        right when facing), +Z = away from camera. The forward vector (hip -> nose)
+        in the (X, Z) plane gives the facing direction.
+        """
+        import numpy as np
+        nose = lm_3d[0]
+        lh = lm_3d[23]
+        rh = lm_3d[24]
+        hip_x = (lh["x"] + rh["x"]) / 2
+        hip_z = (lh["z"] + rh["z"]) / 2
+        fx = nose["x"] - hip_x
+        fz = nose["z"] - hip_z
+        # Angle measured from -Z (facing camera) clockwise (toward -X = subject's right)
+        angle_deg = float(np.degrees(np.arctan2(-fx, -fz)))
+        if angle_deg < 0:
+            angle_deg += 360.0
+        return angle_deg
+
     def _map_kp_to_mesh(self, kp_norm, mesh_bounds, height_cm):
         """
         Map normalized keypoints (u in [0,1] X, v in [0,1] Y top-down) to PIFuHD mesh frame:
@@ -197,23 +272,21 @@ class BodyScanner:
             img_path = os.path.join(in_dir, "person.png")
             Image.open(io.BytesIO(image_bytes)).convert("RGB").save(img_path)
 
+            # Match PIFuHD Colab rectangle formula: use MediaPipe keypoints
+            # radius = 0.65 * max(bbox_width, bbox_height) - gives generous context
             x1, y1, x2, y2 = bbox
             W, H = img_size
-            pad_x = int((x2 - x1) * 0.10)
-            pad_y = int((y2 - y1) * 0.05)
-            x1 = max(0, x1 - pad_x)
-            y1 = max(0, y1 - pad_y)
-            x2 = min(W, x2 + pad_x)
-            y2 = min(H, y2 + pad_y)
-            w = x2 - x1
-            h = y2 - y1
-            side = max(w, h)
+            bw = x2 - x1
+            bh = y2 - y1
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
-            x1 = max(0, cx - side // 2)
-            y1 = max(0, cy - side // 2)
+            radius = int(0.65 * max(bw, bh))
+            rect_x = cx - radius
+            rect_y = cy - radius
+            rect_side = 2 * radius
             with open(os.path.join(in_dir, "person_rect.txt"), "w") as f:
-                f.write(f"{x1} {y1} {side} {side}\n")
+                f.write(f"{rect_x} {rect_y} {rect_side} {rect_side}\n")
+            print(f"Rect: x={rect_x} y={rect_y} side={rect_side} (img: {W}x{H})")
 
             cmd = [
                 "--dataroot", in_dir, "--results_path", out_dir,
@@ -383,15 +456,12 @@ class BodyScanner:
             pass
         return new_mesh
 
-    def _correct_mesh_depth_with_silhouette(self, mesh, side_sil, height_cm):
+    def _correct_mesh_depth_with_silhouette(self, mesh, side_sil, height_cm,
+                                             profile_img_bytes=None):
         """
-        Deform mesh Z to match side silhouette depth (for pregnancy, abdominal bulge).
-        Strategy:
-          - Per-Y level: compute target Z scale factor (sil_depth / mesh_depth)
-          - Smooth scale factors across Y (Gaussian)
-          - Apply SYMMETRIC scaling around mesh Z center
-          - Use continuous interpolation to avoid staircase
-        Symmetric scaling produces smoother mesh without artifacts.
+        SMOOTH deformation of mesh Z to match side silhouette.
+        Optionally uses MediaPipe on profile photo for accurate body height calibration
+        (silhouette bbox may include hair/shadows, inflating height and underestimating depth).
         """
         import numpy as np
         from scipy.ndimage import gaussian_filter1d
@@ -407,53 +477,108 @@ class BodyScanner:
         sil_bot = len(rows) - 1 - rows[::-1].argmax()
         sil_h = sil_bot - sil_top + 1
 
-        verts = mesh.vertices.astype(np.float32)
+        # Try to get accurate body height from MediaPipe Pose on profile photo
+        # (sil_h from rembg bbox is often inflated by hair/shadows)
+        calibration_factor = 1.0
+        if profile_img_bytes is not None:
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(profile_img_bytes)).convert("RGB")
+                img_np = np.array(img)
+                with self.mp_pose.Pose(
+                    static_image_mode=True, model_complexity=2,
+                    enable_segmentation=False, min_detection_confidence=0.5,
+                ) as pose:
+                    results = pose.process(img_np)
+                if results.pose_landmarks:
+                    H_img = img_np.shape[0]
+                    nose = results.pose_landmarks.landmark[0]
+                    # ankles idx 27 and 28
+                    l_ankle = results.pose_landmarks.landmark[27]
+                    r_ankle = results.pose_landmarks.landmark[28]
+                    ankle_y = max(l_ankle.y, r_ankle.y) * H_img
+                    nose_y = nose.y * H_img
+                    real_body_height_pix = ankle_y - nose_y
+                    # ratio to sil_h
+                    if real_body_height_pix > 50:
+                        calibration_factor = real_body_height_pix / sil_h
+                        print(f"Profile calib: sil_h={sil_h}px, "
+                              f"real_body_h={real_body_height_pix:.0f}px, "
+                              f"factor={calibration_factor:.3f}")
+            except Exception as e:
+                print(f"Profile calibration failed: {e}")
+
+        verts = mesh.vertices.astype(np.float32).copy()
         target_h = height_cm / 100.0
 
-        n_levels = 80
-        y_edges = np.linspace(0, target_h, n_levels + 1)
-        scales = np.ones(n_levels)
+        n_levels = 100
+        y_samples = np.linspace(0, target_h, n_levels)
+        z_extra = np.zeros(n_levels, dtype=np.float32)
 
+        band_width = target_h / n_levels * 2.0
+        # Debug: log a few representative levels
+        debug_levels = [int(n_levels * f) for f in (0.3, 0.5, 0.7, 0.85)]
         for i in range(n_levels):
-            y_center = (y_edges[i] + y_edges[i + 1]) / 2
-            mask = (verts[:, 1] >= y_edges[i]) & (verts[:, 1] < y_edges[i + 1])
+            y = y_samples[i]
+            mask = np.abs(verts[:, 1] - y) < band_width
             if mask.sum() < 5:
                 continue
             mesh_z_extent = float(verts[mask, 2].max() - verts[mask, 2].min())
 
-            y_norm = y_center / target_h
-            y_pix_in_sil = int(sil_top + y_norm * sil_h)
-            y_pix_in_sil = max(0, min(side_sil.shape[0] - 1, y_pix_in_sil))
-            cols = np.where(side_sil[y_pix_in_sil] > 0)[0]
+            y_norm = y / target_h
+            row = int(sil_top + y_norm * sil_h)
+            row = max(0, min(side_sil.shape[0] - 1, row))
+            cols = np.where(side_sil[row] > 0)[0]
             if len(cols) < 2:
                 continue
-            sil_depth_m = ((cols.max() - cols.min()) / sil_h) * target_h
+            # Apply calibration: if bbox was inflated (factor<1), depths were understated
+            sil_depth_m = ((cols.max() - cols.min()) / sil_h) * target_h / max(calibration_factor, 0.3)
 
-            if mesh_z_extent > 1e-4:
-                s = sil_depth_m / mesh_z_extent
-                scales[i] = max(0.95, min(s, 1.5))  # allow slight shrink or 1.5x expand
+            if i in debug_levels:
+                print(f"  Y={y:.2f}m mesh_z={mesh_z_extent*100:.1f}cm "
+                      f"sil_z={sil_depth_m*100:.1f}cm")
 
-        # Heavy smoothing along Y for continuous mesh (no bands)
-        scales = gaussian_filter1d(scales, sigma=4.0)
+            # More aggressive correction: smaller margin, bigger cap
+            if sil_depth_m > mesh_z_extent + 0.005:  # 5mm margin
+                z_extra[i] = min(sil_depth_m - mesh_z_extent, 0.20)  # cap 20cm
 
-        n_corrected = ((scales > 1.03) | (scales < 0.98)).sum()
-        print(f"Mesh depth correction: {n_corrected}/{n_levels} levels "
-              f"(min={scales.min():.2f}, max={scales.max():.2f})")
+        # Moderate smoothing (preserves belly peak better)
+        z_extra = gaussian_filter1d(z_extra, sigma=3.0)
 
-        # Continuous interpolation (no staircase)
+        n_affected = (z_extra > 0.01).sum()
+        print(f"Belly deformation: {n_affected}/{n_levels} levels "
+              f"(max extra={z_extra.max()*100:.1f}cm, smooth front push)")
+
+        if z_extra.max() < 0.01:
+            return mesh  # nothing to do
+
+        # Per-vertex extra Z from Y interpolation (continuous)
         y_norm_per_vert = np.clip(verts[:, 1] / target_h, 0, 0.999)
-        level_f = y_norm_per_vert * n_levels - 0.5
+        level_f = y_norm_per_vert * (n_levels - 1)
         level_lo = np.clip(np.floor(level_f).astype(int), 0, n_levels - 1)
         level_hi = np.clip(level_lo + 1, 0, n_levels - 1)
         t = np.clip(level_f - level_lo, 0, 1)
-        per_vert_scale = scales[level_lo] * (1 - t) + scales[level_hi] * t
+        per_vert_extra = z_extra[level_lo] * (1 - t) + z_extra[level_hi] * t
 
-        # Symmetric scaling around mesh Z center
+        # Front weight: 1 at z_max, 0 at z_center, 0 at z_min
+        # Cosine easing for smoothness: 0 at center, 1 at front
         z_center = verts[:, 2].mean()
-        v_new = verts.copy()
-        v_new[:, 2] = z_center + (verts[:, 2] - z_center) * per_vert_scale
+        z_max = verts[:, 2].max()
+        front_range = max(z_max - z_center, 1e-4)
+        rel = np.clip((verts[:, 2] - z_center) / front_range, 0, 1)
+        front_weight = 0.5 - 0.5 * np.cos(np.pi * rel)  # smooth 0->1 cosine
 
-        return trimesh.Trimesh(vertices=v_new, faces=mesh.faces, process=False)
+        verts[:, 2] += per_vert_extra * front_weight
+
+        out = trimesh.Trimesh(vertices=verts, faces=mesh.faces, process=False)
+
+        # Final smoothing to remove any geometric artifacts from deformation
+        try:
+            trimesh.smoothing.filter_taubin(out, lamb=0.5, nu=-0.53, iterations=15)
+        except Exception:
+            pass
+        return out
 
     def _normalize_mesh(self, mesh, height_cm, flip_y=None):
         """Scale + translate: head at Y=0, feet at Y=height_m, centered in X/Z.
@@ -935,12 +1060,251 @@ class BodyScanner:
         measurements["torso_length"] = round(abs(shoulder_y - hip_y) * 100.0, 1)
         return measurements, slices_3d
 
+    def _apply_uv_texture(self, mesh, photos):
+        """
+        UV texture mapping: per-vertex, pick best view via normal alignment,
+        project to that view's image, pack in atlas 2x2.
+        Returns (uvs array, atlas PNG base64).
+        """
+        import numpy as np
+        from PIL import Image
+        import io, base64, trimesh
+
+        verts = mesh.vertices
+        # Compute vertex normals if not present
+        if mesh.vertex_normals is None or len(mesh.vertex_normals) != len(verts):
+            mesh.vertex_normals  # trigger computation
+        normals = np.array(mesh.vertex_normals)
+
+        # PIFuHD coordinate convention: FRONT of body = -Z direction
+        # Camera position for front view is at -Z, so normals pointing -Z are best seen
+        cam_from_body = {
+            "front": np.array([0.0, 0.0, -1.0]),  # front of body faces -Z
+            "back":  np.array([0.0, 0.0, 1.0]),
+            "left":  np.array([-1.0, 0.0, 0.0]),
+            "right": np.array([1.0, 0.0, 0.0]),
+        }
+
+        # Score each vertex for each view = normal dot cam_direction
+        n_verts = len(verts)
+        scores = np.zeros((n_verts, 4), dtype=np.float32)
+        view_order = ["front", "left", "back", "right"]
+        for i, view in enumerate(view_order):
+            scores[:, i] = normals @ cam_from_body[view]
+
+        best_view_idx = np.argmax(scores, axis=1)
+
+        # Mesh bounds for UV normalization
+        v_min = verts.min(axis=0)
+        v_max = verts.max(axis=0)
+        x_min, y_min, z_min = v_min
+        x_max, y_max, z_max = v_max
+        x_rng = max(x_max - x_min, 1e-6)
+        y_rng = max(y_max - y_min, 1e-6)
+        z_rng = max(z_max - z_min, 1e-6)
+
+        # Per-vertex UV in LOCAL view space (u, v in [0,1])
+        uvs_local = np.zeros((n_verts, 2), dtype=np.float32)
+
+        # Front view: U = X (left-right), V = flipped Y (head at top)
+        mask_front = best_view_idx == 0
+        uvs_local[mask_front, 0] = (verts[mask_front, 0] - x_min) / x_rng
+        uvs_local[mask_front, 1] = 1.0 - (verts[mask_front, 1] - y_min) / y_rng
+
+        # Left profile: U = Z (forward-back), V = flipped Y
+        mask_left = best_view_idx == 1
+        uvs_local[mask_left, 0] = (verts[mask_left, 2] - z_min) / z_rng
+        uvs_local[mask_left, 1] = 1.0 - (verts[mask_left, 1] - y_min) / y_rng
+
+        # Back view: U = flipped X, V = flipped Y
+        mask_back = best_view_idx == 2
+        uvs_local[mask_back, 0] = 1.0 - (verts[mask_back, 0] - x_min) / x_rng
+        uvs_local[mask_back, 1] = 1.0 - (verts[mask_back, 1] - y_min) / y_rng
+
+        # Right profile: U = flipped Z, V = flipped Y
+        mask_right = best_view_idx == 3
+        uvs_local[mask_right, 0] = 1.0 - (verts[mask_right, 2] - z_min) / z_rng
+        uvs_local[mask_right, 1] = 1.0 - (verts[mask_right, 1] - y_min) / y_rng
+
+        # Atlas: 2x2 grid of cropped body photos (each 512x512 -> 1024x1024 total)
+        from rembg import remove
+        sub = 512
+        atlas = Image.new("RGB", (sub * 2, sub * 2), (32, 32, 32))
+        atlas_offsets = {
+            "front": (0, 0),
+            "left":  (sub, 0),
+            "back":  (0, sub),
+            "right": (sub, sub),
+        }
+        for view in view_order:
+            if view not in photos:
+                continue
+            img = Image.open(io.BytesIO(photos[view])).convert("RGB")
+            # Find body bbox via rembg and crop tight
+            alpha = np.array(remove(img))[:, :, 3]
+            mask_b = alpha > 128
+            if not mask_b.any():
+                img_sq = img.resize((sub, sub), Image.LANCZOS)
+                atlas.paste(img_sq, atlas_offsets[view])
+                continue
+            rows_b = np.any(mask_b, axis=1)
+            cols_b = np.any(mask_b, axis=0)
+            top_b = rows_b.argmax()
+            bot_b = len(rows_b) - 1 - rows_b[::-1].argmax()
+            left_b = cols_b.argmax()
+            right_b = len(cols_b) - 1 - cols_b[::-1].argmax()
+            cropped = img.crop((left_b, top_b, right_b + 1, bot_b + 1))
+            # Stretch (don't preserve aspect) so body fills entire quadrant
+            # -> UV mapping maps mesh bbox directly to body pixels
+            stretched = cropped.resize((sub, sub), Image.LANCZOS)
+            atlas.paste(stretched, atlas_offsets[view])
+
+        # Atlas UV quadrants: each view occupies a quarter of [0,1]x[0,1]
+        # front: u in [0, 0.5], v in [0.5, 1.0]   (upper-left)
+        # left:  u in [0.5, 1.0], v in [0.5, 1.0] (upper-right)
+        # back:  u in [0, 0.5], v in [0, 0.5]     (lower-left)
+        # right: u in [0.5, 1.0], v in [0, 0.5]   (lower-right)
+        # Note: PIL paste puts (0,0) at top-left; GL UV (0,0) is bottom-left.
+        # So the image Y is already flipped vs UV Y.
+        atlas_quads = {
+            0: (0.0, 0.5, 0.5, 1.0),  # front
+            1: (0.5, 0.0, 0.5, 1.0),  # left
+            2: (0.0, 0.0, 0.5, 0.5),  # back
+            3: (0.5, 0.0, 1.0, 0.5),  # right
+        }
+        # Actually let's compute uv offset per quadrant:
+        # front @ (0,0) in image (top-left): UV u=[0, 0.5], v=[0.5, 1.0]
+        # left @ (sub, 0) in image: u=[0.5, 1.0], v=[0.5, 1.0]
+        # back @ (0, sub) in image: u=[0, 0.5], v=[0, 0.5]
+        # right @ (sub, sub) in image: u=[0.5, 1.0], v=[0, 0.5]
+        uv_offsets = {
+            0: (0.0, 0.5),   # front: u starts at 0, v starts at 0.5
+            1: (0.5, 0.5),   # left
+            2: (0.0, 0.0),   # back
+            3: (0.5, 0.0),   # right
+        }
+
+        uvs_atlas = np.zeros((n_verts, 2), dtype=np.float32)
+        for v_idx in range(4):
+            mask = best_view_idx == v_idx
+            u_off, v_off = uv_offsets[v_idx]
+            uvs_atlas[mask, 0] = u_off + uvs_local[mask, 0] * 0.5
+            uvs_atlas[mask, 1] = v_off + uvs_local[mask, 1] * 0.5
+
+        # Encode atlas to JPEG base64 (smaller than PNG)
+        buf = io.BytesIO()
+        atlas.save(buf, format="JPEG", quality=85)
+        atlas_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        print(f"UV texture: {n_verts} vertices, atlas {sub*2}x{sub*2}, "
+              f"views: f={mask_front.sum()} l={mask_left.sum()} "
+              f"b={mask_back.sum()} r={mask_right.sum()}")
+
+        return uvs_atlas.tolist(), atlas_b64
+
+    def _build_visual_hull_mesh(self, silhouettes, height_cm, voxel_size_mm=4):
+        """
+        Build body mesh from 4 silhouettes via voxel-based visual hull + marching cubes.
+        Non-parametric, no ML bias: works for any body morphology (pregnancy, obesity...).
+        """
+        import numpy as np
+        from skimage.measure import marching_cubes
+        from scipy.ndimage import gaussian_filter
+        import trimesh
+
+        body_h_mm = height_cm * 10.0
+        body_w_mm = body_h_mm * 0.55
+        body_d_mm = body_h_mm * 0.45
+
+        nx = max(int(body_w_mm / voxel_size_mm), 64)
+        ny = max(int(body_h_mm / voxel_size_mm), 256)
+        nz = max(int(body_d_mm / voxel_size_mm), 64)
+        print(f"Visual hull voxel grid: {nx}x{ny}x{nz} ({nx*ny*nz/1e6:.1f}M voxels)")
+
+        x_coords = (np.arange(nx) + 0.5) * voxel_size_mm - body_w_mm / 2
+        y_coords = (np.arange(ny) + 0.5) * voxel_size_mm
+        z_coords = (np.arange(nz) + 0.5) * voxel_size_mm - body_d_mm / 2
+
+        voxels = np.ones((nx, ny, nz), dtype=bool)
+
+        def crop_sil(sil):
+            rows = np.any(sil > 0, axis=1)
+            cols = np.any(sil > 0, axis=0)
+            if not rows.any() or not cols.any():
+                return None
+            t = rows.argmax()
+            b = len(rows) - 1 - rows[::-1].argmax()
+            l = cols.argmax()
+            r = len(cols) - 1 - cols[::-1].argmax()
+            return sil[t:b + 1, l:r + 1].astype(bool)
+
+        for view, sil_raw in silhouettes.items():
+            sil = crop_sil(sil_raw)
+            if sil is None:
+                continue
+            sil_h, sil_w = sil.shape
+            row_idx = np.clip((y_coords / body_h_mm * sil_h).astype(int), 0, sil_h - 1)
+            if view == "front":
+                x_in = x_coords + body_w_mm / 2
+                col_idx = np.clip((x_in / body_w_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_xy = sil[np.ix_(row_idx, col_idx)].T  # (nx, ny)
+                voxels &= mask_xy[:, :, None]
+            elif view == "back":
+                x_in = -x_coords + body_w_mm / 2
+                col_idx = np.clip((x_in / body_w_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_xy = sil[np.ix_(row_idx, col_idx)].T
+                voxels &= mask_xy[:, :, None]
+            elif view == "left":
+                z_in = z_coords + body_d_mm / 2
+                col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_yz = sil[np.ix_(row_idx, col_idx)]  # (ny, nz)
+                voxels &= mask_yz[None, :, :]
+            elif view == "right":
+                z_in = -z_coords + body_d_mm / 2
+                col_idx = np.clip((z_in / body_d_mm * sil_w).astype(int), 0, sil_w - 1)
+                mask_yz = sil[np.ix_(row_idx, col_idx)]
+                voxels &= mask_yz[None, :, :]
+
+        filled = int(voxels.sum())
+        print(f"Hull: {filled} filled voxels ({100*filled/voxels.size:.1f}%)")
+        if filled < 1000:
+            return None
+
+        # Aggressive smoothing for nice isosurface
+        v_smooth = gaussian_filter(voxels.astype(np.float32), sigma=1.2)
+        v_padded = np.pad(v_smooth, 1, mode='constant', constant_values=0)
+
+        verts, faces, _, _ = marching_cubes(
+            v_padded, level=0.5, spacing=(voxel_size_mm,) * 3
+        )
+
+        # Re-center
+        verts[:, 0] -= voxel_size_mm + body_w_mm / 2
+        verts[:, 1] -= voxel_size_mm
+        verts[:, 2] -= voxel_size_mm + body_d_mm / 2
+        verts /= 1000.0  # mm -> m
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        try:
+            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
+        except Exception:
+            pass
+
+        print(f"Visual hull mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+        return mesh
+
     def _do_analyze(self, photos: dict, height_cm: float):
-        """Fully non-parametric pipeline: PIFuHD + MediaPipe + silhouette depth correction."""
+        """
+        Clean pipeline:
+        - PIFuHD at resolution 512 on front photo (captures body morphology)
+        - UV texture from 4 photos (photorealistic)
+        - MediaPipe keypoints + measurements
+        No corrections/deformations - trust PIFuHD output.
+        """
         import numpy as np
 
-        # 1. Silhouettes from all 4 views (for depth correction at belly level)
-        print("Extracting silhouettes from all views...")
+        # Silhouettes for UV atlas + measurements
+        print("Extracting silhouettes...")
         all_silhouettes = {}
         front_bbox = None
         front_img_size = None
@@ -955,24 +1319,56 @@ class BodyScanner:
         if front_bbox is None:
             return {"error": "Personne non detectee sur la photo de face"}
 
-        # 2. PIFuHD reconstruction from front photo
+        # PIFuHD on FRONT photo (standard colab pipeline)
+        print("Running PIFuHD on front photo...")
         pifu_mesh = self._run_pifuhd(photos["front"], front_bbox, front_img_size)
         if pifu_mesh is None:
             return {"error": "Reconstruction 3D echouee"}
 
-        # 3. Normalize: head at Y=0, feet at height_m
+        # Only normalize (scale + flip if needed)
         pifu_mesh = self._normalize_mesh(pifu_mesh, height_cm)
 
-        # 3b. Fit mesh to visual hull from 4 silhouettes (captures pregnancy, etc.)
-        if len(all_silhouettes) >= 2:
+        # Correct mesh depth using LEFT profile silhouette (captures belly/pregnancy)
+        # Uses smooth cosine easing, asymmetric forward push, Taubin post-smooth
+        side_sil_for_correction = all_silhouettes.get("left")
+        profile_photo_for_calib = photos.get("left")
+        if side_sil_for_correction is None:
+            side_sil_for_correction = all_silhouettes.get("right")
+            profile_photo_for_calib = photos.get("right")
+        if side_sil_for_correction is not None:
             try:
-                pifu_mesh = self._fit_mesh_to_visual_hull(pifu_mesh, all_silhouettes, height_cm)
+                pifu_mesh = self._correct_mesh_depth_with_silhouette(
+                    pifu_mesh, side_sil_for_correction, height_cm,
+                    profile_img_bytes=profile_photo_for_calib,
+                )
             except Exception as e:
-                print(f"Visual hull fit failed: {e}")
+                print(f"Depth correction failed: {e}")
                 import traceback
                 traceback.print_exc()
 
-        # 4. MediaPipe keypoints on front photo, mapped to mesh frame
+        # Decimate mesh for smaller response size
+        n_v_before = len(pifu_mesh.vertices)
+        print(f"Pre-decimation: {n_v_before} verts, {len(pifu_mesh.faces)} faces")
+        if n_v_before > 60000:
+            try:
+                import fast_simplification
+                import trimesh as _trimesh
+                import numpy as _np
+                target_faces = 80000
+                new_v, new_f = fast_simplification.simplify(
+                    _np.asarray(pifu_mesh.vertices, dtype=_np.float32),
+                    _np.asarray(pifu_mesh.faces, dtype=_np.uint32),
+                    target_count=target_faces,
+                )
+                pifu_mesh = _trimesh.Trimesh(vertices=new_v, faces=new_f, process=False)
+                print(f"Decimated: {len(pifu_mesh.vertices)} verts, "
+                      f"{len(pifu_mesh.faces)} faces")
+            except Exception as e:
+                print(f"Decimation failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # MediaPipe keypoints
         print("Detecting keypoints (MediaPipe)...")
         kp_norm = self._detect_pose_keypoints(photos["front"], front_bbox, front_img_size)
         if kp_norm is None:
@@ -982,10 +1378,21 @@ class BodyScanner:
         kp_on_mesh = self._map_kp_to_mesh(kp_norm, mesh_bounds, height_cm)
         kp_snapped = self._snap_keypoints_to_mesh(kp_on_mesh, pifu_mesh)
 
-        # 5. Measurements via slicing (with silhouette-based depth correction)
+        # Measurements
         measurements, slices_3d = self._measurements_from_mesh(
             pifu_mesh, kp_snapped, height_cm, silhouettes=all_silhouettes
         )
+
+        # UV texture mapping
+        uvs = None
+        texture_b64 = None
+        try:
+            print("Applying UV texture mapping...")
+            uvs, texture_b64 = self._apply_uv_texture(pifu_mesh, photos)
+        except Exception as e:
+            print(f"UV texture failed: {e}")
+            import traceback
+            traceback.print_exc()
 
         return {
             "success": True,
@@ -994,7 +1401,9 @@ class BodyScanner:
             "faces": pifu_mesh.faces.tolist(),
             "keypoints_3d": kp_snapped,
             "slices": slices_3d,
-            "viz_source": "pifuhd+mediapipe",
+            "uvs": uvs,
+            "texture_b64": texture_b64,
+            "viz_source": "pifuhd_512_uv",
         }
 
     @modal.method()
@@ -1002,8 +1411,20 @@ class BodyScanner:
         return self._do_analyze(photos, height_cm)
 
     @modal.method()
-    def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0):
-        import tempfile, os, subprocess, cv2
+    def analyze_video(self, video_bytes: bytes, height_cm: float = 170.0,
+                      n_frames: int = 16, n_candidates: int = 32):
+        """
+        Video-based multi-view reconstruction with robust angle estimation:
+        1. Extract n_candidates frames evenly from video
+        2. For each: blur score (Laplacian) + MediaPipe pose (2D+3D world landmarks)
+        3. Drop blurry frames and frames where pose was not detected
+        4. Compute real rotation angle per frame from world landmarks (hip->nose vector)
+        5. Bucket frames into n_frames angular bins, keep sharpest per bin
+        6. Voxel visual hull + marching cubes + Taubin smoothing
+        7. Multi-view UV texture projection
+        8. Measurements
+        """
+        import tempfile, os, subprocess, cv2, numpy as np
 
         with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
             f.write(video_bytes)
@@ -1016,26 +1437,352 @@ class BodyScanner:
             )
         except Exception:
             mp4 = raw
+
         try:
             cap = cv2.VideoCapture(mp4)
-            n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if n < 4: return {"error": "Video trop courte"}
-            indices = [0, n // 4, n // 2, 3 * n // 4]
-            views = ["front", "left", "back", "right"]
-            photos = {}
-            for idx, name in zip(indices, views):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total < 4:
+                return {"error": "Video trop courte"}
+
+            print(f"Extracting {n_candidates} candidate frames from {total} total...")
+            indices = np.linspace(0, total - 1, n_candidates).astype(int)
+            candidates = []  # list of dicts {jpeg, blur, pose, t_idx}
+            for t_idx, idx in enumerate(indices):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
                 ok, frame = cap.read()
-                if not ok: continue
-                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                photos[name] = buf.tobytes()
+                if not ok:
+                    continue
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                jpeg = buf.tobytes()
+                candidates.append({"jpeg": jpeg, "t_idx": int(t_idx)})
             cap.release()
-            if len(photos) < 4: return {"error": "Impossible d'extraire 4 frames"}
-            return self._do_analyze(photos, height_cm)
+
+            if len(candidates) < 4:
+                return {"error": "Impossible d'extraire assez de frames"}
+
+            print(f"Scoring {len(candidates)} candidates (blur + pose)...")
+            scored = []
+            for c in candidates:
+                blur = self._blur_score(c["jpeg"])
+                pose = self._pose_full(c["jpeg"], model_complexity=1)
+                if pose is None:
+                    continue
+                angle = self._estimate_orientation_deg(pose["lm_3d"])
+                scored.append({
+                    "jpeg": c["jpeg"], "blur": blur,
+                    "angle": angle, "t_idx": c["t_idx"],
+                })
+
+            if len(scored) < 4:
+                return {"error": "Pose detectee sur trop peu de frames"}
+
+            blurs = sorted(s["blur"] for s in scored)
+            blur_floor = max(blurs[len(blurs) // 4] * 0.6, 30.0)
+            scored = [s for s in scored if s["blur"] >= blur_floor]
+            if len(scored) < 4:
+                return {"error": "Trop peu de frames nettes"}
+
+            print(f"Pose+sharp on {len(scored)}/{len(candidates)} candidates "
+                  f"(blur floor={blur_floor:.0f})")
+
+            buckets = [[] for _ in range(n_frames)]
+            for s in scored:
+                bi = int(s["angle"] / 360.0 * n_frames) % n_frames
+                buckets[bi].append(s)
+            selected = []
+            for bi, bucket in enumerate(buckets):
+                if not bucket:
+                    continue
+                best = max(bucket, key=lambda x: x["blur"])
+                selected.append((best["angle"], best["jpeg"]))
+            selected.sort(key=lambda x: x[0])
+
+            covered = len(selected)
+            angles_str = ",".join(f"{a:.0f}" for a, _ in selected)
+            print(f"Selected {covered}/{n_frames} frames covering angles: [{angles_str}]")
+
+            if covered < 4:
+                return {"error": f"Couverture angulaire insuffisante ({covered} vues)"}
+
+            return self._do_analyze_video(selected, height_cm)
         finally:
             for p in (raw, mp4):
                 try: os.unlink(p)
                 except: pass
+
+    def _do_analyze_video(self, frames, height_cm):
+        """
+        Process N frames (angle, jpeg_bytes) from rotating video.
+        Each frame is a different angle (0..360 deg).
+        """
+        import numpy as np
+
+        n = len(frames)
+        print(f"Analyzing {n} frames (angles {frames[0][0]:.0f}..{frames[-1][0]:.0f} deg)")
+
+        # Extract silhouettes for all frames
+        print("Extracting silhouettes...")
+        silhouettes = []  # list of (angle, silhouette_2d, bbox, img_size)
+        for angle, img_bytes in frames:
+            sil, bbox, img_size = self._silhouette_and_bbox(img_bytes)
+            if sil is not None:
+                silhouettes.append((angle, sil, bbox, img_size))
+
+        if len(silhouettes) < 4:
+            return {"error": "Trop peu de silhouettes valides"}
+
+        # Build voxel visual hull from all angles
+        print(f"Building visual hull from {len(silhouettes)} angles...")
+        hull_mesh = self._build_hull_from_rotation(silhouettes, height_cm)
+        if hull_mesh is None:
+            return {"error": "Reconstruction visual hull echouee"}
+
+        hull_mesh = self._normalize_mesh(hull_mesh, height_cm, flip_y=False)
+
+        # MediaPipe on the first frame (typically front)
+        first_img = frames[0][1]
+        sil0, bbox0, img_size0 = self._silhouette_and_bbox(first_img)
+        print("Detecting keypoints (MediaPipe)...")
+        kp_norm = self._detect_pose_keypoints(first_img, bbox0, img_size0)
+        if kp_norm is None:
+            return {"error": "Keypoints non detectes"}
+
+        mesh_bounds = hull_mesh.bounds
+        kp_on_mesh = self._map_kp_to_mesh(kp_norm, mesh_bounds, height_cm)
+        kp_snapped = self._snap_keypoints_to_mesh(kp_on_mesh, hull_mesh)
+
+        # Measurements
+        silhouettes_dict = {"front": silhouettes[0][1]}
+        mid_idx = n // 4
+        if mid_idx < len(silhouettes):
+            silhouettes_dict["left"] = silhouettes[mid_idx][1]
+        measurements, slices_3d = self._measurements_from_mesh(
+            hull_mesh, kp_snapped, height_cm, silhouettes=silhouettes_dict
+        )
+
+        # Multi-view UV texture mapping
+        uvs = None
+        texture_b64 = None
+        try:
+            print("Applying multi-view UV texture...")
+            uvs, texture_b64 = self._apply_uv_texture_multiview(hull_mesh, frames)
+        except Exception as e:
+            print(f"UV texture failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return {
+            "success": True,
+            "measurements": measurements,
+            "vertices": hull_mesh.vertices.tolist(),
+            "faces": hull_mesh.faces.tolist(),
+            "keypoints_3d": kp_snapped,
+            "slices": slices_3d,
+            "uvs": uvs,
+            "texture_b64": texture_b64,
+            "viz_source": "video_visual_hull",
+        }
+
+    def _build_hull_from_rotation(self, silhouettes_with_angle, height_cm,
+                                    voxel_size_mm=5):
+        """
+        Build voxel visual hull from N silhouettes, each at a known angle around
+        the vertical (Y) axis. Subject assumed to rotate in place, camera fixed.
+        """
+        import numpy as np
+        from skimage.measure import marching_cubes
+        from scipy.ndimage import gaussian_filter
+        import trimesh
+
+        body_h_mm = height_cm * 10.0
+        body_w_mm = body_h_mm * 0.55
+        body_d_mm = body_h_mm * 0.55  # symmetrical X/Z for rotation
+
+        nx = max(int(body_w_mm / voxel_size_mm), 64)
+        ny = max(int(body_h_mm / voxel_size_mm), 256)
+        nz = max(int(body_d_mm / voxel_size_mm), 64)
+        print(f"Voxel grid: {nx}x{ny}x{nz} ({nx*ny*nz/1e6:.1f}M voxels)")
+
+        # Voxel center coordinates (mm)
+        x_coords = (np.arange(nx) + 0.5) * voxel_size_mm - body_w_mm / 2
+        y_coords = (np.arange(ny) + 0.5) * voxel_size_mm
+        z_coords = (np.arange(nz) + 0.5) * voxel_size_mm - body_d_mm / 2
+
+        voxels = np.ones((nx, ny, nz), dtype=bool)
+
+        def crop_sil(sil):
+            rows = np.any(sil > 0, axis=1)
+            cols = np.any(sil > 0, axis=0)
+            if not rows.any() or not cols.any():
+                return None
+            t = rows.argmax()
+            b = len(rows) - 1 - rows[::-1].argmax()
+            l = cols.argmax()
+            r = len(cols) - 1 - cols[::-1].argmax()
+            return sil[t:b + 1, l:r + 1].astype(bool)
+
+        # For each angle, rotate voxel positions and project to silhouette
+        for angle_deg, sil_raw, _, _ in silhouettes_with_angle:
+            sil = crop_sil(sil_raw)
+            if sil is None:
+                continue
+            sil_h, sil_w = sil.shape
+            theta = np.deg2rad(angle_deg)
+            cos_t = np.cos(theta)
+            sin_t = np.sin(theta)
+
+            # Row index for each Y (same for all angles)
+            row_idx = np.clip((y_coords / body_h_mm * sil_h).astype(int), 0, sil_h - 1)
+
+            # For each voxel at angle=0 (x, y, z), when subject rotates by angle,
+            # camera sees position rotated by -angle:
+            # x' = x*cos + z*sin (horizontal in image)
+            # Sil width represents X' range from -body_w/2 to +body_w/2
+            # Vectorize: compute x' for each (x, z) pair
+            x_rot = x_coords[:, None] * cos_t + z_coords[None, :] * sin_t  # (nx, nz)
+            # Map x_rot to column index
+            col_idx = np.clip(
+                ((x_rot + body_w_mm / 2) / body_w_mm * sil_w).astype(int),
+                0, sil_w - 1
+            )  # (nx, nz)
+
+            # mask[i, j, k] = sil[row_idx[j], col_idx[i, k]]
+            # Build using advanced indexing
+            mask = sil[row_idx[None, :, None], col_idx[:, None, :]]  # (nx, ny, nz)
+            voxels &= mask
+
+        filled = int(voxels.sum())
+        print(f"Hull: {filled} voxels ({100*filled/voxels.size:.1f}%)")
+        if filled < 1000:
+            return None
+
+        # Smooth + marching cubes
+        v_smooth = gaussian_filter(voxels.astype(np.float32), sigma=1.0)
+        v_padded = np.pad(v_smooth, 1, mode='constant', constant_values=0)
+        verts, faces, _, _ = marching_cubes(v_padded, level=0.5,
+                                            spacing=(voxel_size_mm,) * 3)
+        verts[:, 0] -= voxel_size_mm + body_w_mm / 2
+        verts[:, 1] -= voxel_size_mm
+        verts[:, 2] -= voxel_size_mm + body_d_mm / 2
+        verts /= 1000.0  # mm -> m
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        try:
+            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
+        except Exception:
+            pass
+
+        # Decimate for response size
+        if len(mesh.vertices) > 60000:
+            try:
+                import fast_simplification
+                new_v, new_f = fast_simplification.simplify(
+                    np.asarray(mesh.vertices, dtype=np.float32),
+                    np.asarray(mesh.faces, dtype=np.uint32),
+                    target_count=80000,
+                )
+                mesh = trimesh.Trimesh(vertices=new_v, faces=new_f, process=False)
+                print(f"Decimated: {len(mesh.vertices)} verts")
+            except Exception as e:
+                print(f"Decimation failed: {e}")
+        print(f"Hull mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+        return mesh
+
+    def _apply_uv_texture_multiview(self, mesh, frames, atlas_cols=4):
+        """
+        Atlas multi-view: arrange N frames in a grid.
+        For each vertex, pick best view by normal.dot(camera_dir_at_angle).
+        """
+        import numpy as np, math, io, base64
+        from PIL import Image
+        from rembg import remove
+
+        verts = mesh.vertices
+        if mesh.vertex_normals is None or len(mesh.vertex_normals) != len(verts):
+            mesh.vertex_normals
+        normals = np.array(mesh.vertex_normals)
+        n_verts = len(verts)
+        n_frames = len(frames)
+
+        # Camera direction for each frame (angle around Y axis)
+        # At angle=0, camera at +Z looking -Z (normal alignment: -Z best)
+        cam_dirs = np.zeros((n_frames, 3), dtype=np.float32)
+        for i, (angle_deg, _) in enumerate(frames):
+            theta = np.deg2rad(angle_deg)
+            cam_dirs[i] = [-np.sin(theta), 0.0, -np.cos(theta)]
+
+        # Score each vertex per view (normal dot cam_dir)
+        scores = normals @ cam_dirs.T  # (n_verts, n_frames)
+        best = np.argmax(scores, axis=1)
+
+        # Atlas grid: atlas_cols columns, rows = ceil(n_frames / atlas_cols)
+        rows_grid = int(np.ceil(n_frames / atlas_cols))
+        sub = 512
+        atlas_w = sub * atlas_cols
+        atlas_h = sub * rows_grid
+        atlas = Image.new("RGB", (atlas_w, atlas_h), (32, 32, 32))
+
+        # Crop body bbox from each frame and paste in atlas
+        atlas_offsets = []  # (x_off, y_off) in atlas pixels, (u_off, v_off) in UV
+        for i, (angle_deg, img_bytes) in enumerate(frames):
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            alpha = np.array(remove(img))[:, :, 3]
+            mask_b = alpha > 128
+            if not mask_b.any():
+                cropped = img
+            else:
+                rows_b = np.any(mask_b, axis=1)
+                cols_b = np.any(mask_b, axis=0)
+                t = rows_b.argmax()
+                b = len(rows_b) - 1 - rows_b[::-1].argmax()
+                l = cols_b.argmax()
+                r = len(cols_b) - 1 - cols_b[::-1].argmax()
+                cropped = img.crop((l, t, r + 1, b + 1))
+            stretched = cropped.resize((sub, sub), Image.LANCZOS)
+            col = i % atlas_cols
+            row = i // atlas_cols
+            atlas.paste(stretched, (col * sub, row * sub))
+            # UV offset (GL convention: V=0 bottom). Image row 0 = top = V at max.
+            u_off = col / atlas_cols
+            # In image, row 0 is top, but with flipY=false, V=0 is also top
+            v_off = row / rows_grid
+            atlas_offsets.append((u_off, v_off))
+
+        # Mesh bounds for UV normalization
+        v_min = verts.min(axis=0)
+        v_max = verts.max(axis=0)
+        x_range = max(v_max[0] - v_min[0], 1e-6)
+        y_range = max(v_max[1] - v_min[1], 1e-6)
+        z_range = max(v_max[2] - v_min[2], 1e-6)
+
+        # Project each vertex to its best view's image plane
+        # View at angle θ sees X' = x*cos - z*sin (horizontal in rotated frame)
+        uvs = np.zeros((n_verts, 2), dtype=np.float32)
+        cell_u = 1.0 / atlas_cols
+        cell_v = 1.0 / rows_grid
+
+        for v_idx in range(n_verts):
+            k = best[v_idx]
+            theta = np.deg2rad(frames[k][0])
+            x, y, z = verts[v_idx]
+            # Project to rotated frame: camera sees X' horizontal
+            x_prime = x * np.cos(theta) + z * np.sin(theta)
+            # Body extents along rotated X at this angle - approximate with max(x_range, z_range)
+            x_prime_range = max(x_range, z_range)
+            u_local = (x_prime - (-x_prime_range / 2)) / x_prime_range
+            u_local = max(0.0, min(1.0, u_local))
+            v_local = 1.0 - (y - v_min[1]) / y_range
+            v_local = max(0.0, min(1.0, v_local))
+            u_off, v_off = atlas_offsets[k]
+            uvs[v_idx, 0] = u_off + u_local * cell_u
+            uvs[v_idx, 1] = v_off + v_local * cell_v
+
+        # Encode atlas
+        buf = io.BytesIO()
+        atlas.save(buf, format="JPEG", quality=80)
+        atlas_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        print(f"UV atlas: {atlas_cols}x{rows_grid} grid, {atlas_w}x{atlas_h}px, {n_frames} views")
+        return uvs.tolist(), atlas_b64
 
 
 # FastAPI

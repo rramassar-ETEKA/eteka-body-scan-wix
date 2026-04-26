@@ -1603,91 +1603,67 @@ class BodyScanner:
 
     def _do_analyze_video(self, frames, height_cm, enable_texture: bool = False):
         """
-        Process N frames (angle, jpeg_bytes, hip_px_x) from rotating video.
-        Each frame is a different angle (0..360 deg).
-        Silhouettes are recentered horizontally on the MediaPipe hip x position
-        so the visual hull rotation axis matches the actual body axis.
+        PIFuHD-based pipeline for video frames.
 
-        Texture mapping (~60-90s) is skipped by default - mesh + measurements
-        are the priority. Set enable_texture=True to compute UV atlas.
+        Strategy:
+        - Pick the BEST frame per cardinal angle (face / profil G / dos / profil D)
+          from the angle-bucketed frames provided by _select_frames_from_jpegs.
+        - Delegate to _do_analyze (the proven 4-photos pipeline) which:
+            1. Runs PIFuHD on the front frame -> humanoid mesh
+            2. Calls _correct_mesh_depth_with_silhouette using the LEFT side
+               silhouette -> deforms the mesh to fit the actual body depth at
+               each Y level (this is what captures the pregnancy belly bulge)
+            3. Computes UV texture (skipped if enable_texture=False on caller)
+            4. Computes measurements via convex hull slicing
+
+        Frames format: list of (angle_deg, jpeg_bytes, hip_px_x).
+        Angles convention (matches _select_frames_from_jpegs):
+            0   = facing camera (front)
+            90  = subject turned right, camera sees subject's LEFT side
+            180 = back
+            270 = subject turned left, camera sees subject's RIGHT side
         """
-        import numpy as np
+        if len(frames) < 2:
+            return {"error": "Pas assez de frames"}
 
-        n = len(frames)
-        print(f"Analyzing {n} frames (angles {frames[0][0]:.0f}..{frames[-1][0]:.0f} deg)")
+        def angular_distance(a, b):
+            d = abs(a - b) % 360.0
+            return min(d, 360.0 - d)
 
-        # Extract silhouettes + hip-recenter horizontally
-        print("Extracting silhouettes (with hip recentering)...")
-        silhouettes = []  # list of (angle, hip_centered_silhouette, bbox, img_size)
-        raw_for_measure = []  # (angle, raw_tight_sil) for side silhouette in measurements
-        for angle, img_bytes, hip_px_x in frames:
-            sil, bbox, img_size = self._silhouette_and_bbox(img_bytes)
-            if sil is None:
-                continue
-            sil_centered = self._hip_centered_silhouette(sil, bbox, hip_px_x)
-            silhouettes.append((angle, sil_centered, bbox, img_size))
-            raw_for_measure.append((angle, sil))
+        def pick_closest(target):
+            return min(frames, key=lambda f: angular_distance(f[0], target))
 
-        if len(silhouettes) < 4:
-            return {"error": "Trop peu de silhouettes valides"}
+        front_f = pick_closest(0)
+        left_f = pick_closest(90)
+        back_f = pick_closest(180)
+        right_f = pick_closest(270)
 
-        # Build voxel visual hull from all angles
-        print(f"Building visual hull from {len(silhouettes)} angles...")
-        hull_mesh = self._build_hull_from_rotation(silhouettes, height_cm)
-        if hull_mesh is None:
-            return {"error": "Reconstruction visual hull echouee"}
+        print(f"Cardinal frames picked: front={front_f[0]:.0f}deg, "
+              f"left={left_f[0]:.0f}deg, back={back_f[0]:.0f}deg, right={right_f[0]:.0f}deg")
 
-        hull_mesh = self._normalize_mesh(hull_mesh, height_cm, flip_y=False)
+        photos = {}
+        TOL = 35.0  # accept frame if within +- TOL of cardinal angle
 
-        # MediaPipe on the first frame (closest to angle 0 = front)
-        first_img = frames[0][1]
-        sil0, bbox0, img_size0 = self._silhouette_and_bbox(first_img)
-        print("Detecting keypoints (MediaPipe)...")
-        kp_norm = self._detect_pose_keypoints(first_img, bbox0, img_size0)
-        if kp_norm is None:
-            return {"error": "Keypoints non detectes"}
+        # Front MUST be present and well-aligned (PIFuHD runs on this)
+        if angular_distance(front_f[0], 0) > TOL:
+            return {"error": f"Pas de vue de face dans la video (meilleur: {front_f[0]:.0f}deg)"}
+        photos["front"] = front_f[1]
 
-        mesh_bounds = hull_mesh.bounds
-        kp_on_mesh = self._map_kp_to_mesh(kp_norm, mesh_bounds, height_cm)
-        kp_snapped = self._snap_keypoints_to_mesh(kp_on_mesh, hull_mesh)
+        if angular_distance(left_f[0], 90) <= TOL:
+            photos["left"] = left_f[1]
+        if angular_distance(back_f[0], 180) <= TOL:
+            photos["back"] = back_f[1]
+        if angular_distance(right_f[0], 270) <= TOL:
+            photos["right"] = right_f[1]
 
-        # Measurements: pass front (raw, tight) and the frame closest to 90deg as side
-        silhouettes_dict = {"front": raw_for_measure[0][1]}
-        # Find the frame with angle closest to 90deg (subject's right turned to camera = sees subject's left side)
-        # This profile view captures Z-depth (belly bulge for pregnancy)
-        side_idx = min(range(len(raw_for_measure)), key=lambda i: abs(raw_for_measure[i][0] - 90))
-        if abs(raw_for_measure[side_idx][0] - 90) < 45:
-            silhouettes_dict["left"] = raw_for_measure[side_idx][1]
-        measurements, slices_3d = self._measurements_from_mesh(
-            hull_mesh, kp_snapped, height_cm, silhouettes=silhouettes_dict
-        )
+        if "left" not in photos and "right" not in photos:
+            return {"error": "Pas de vue de profil dans la video (necessaire pour la correction du ventre)"}
 
-        # Multi-view UV texture mapping (skipped by default - saves ~60-90s)
-        uvs = None
-        texture_b64 = None
-        if enable_texture:
-            try:
-                print("Applying multi-view UV texture...")
-                tex_frames = [(a, j) for a, j, _ in frames]
-                uvs, texture_b64 = self._apply_uv_texture_multiview(hull_mesh, tex_frames)
-            except Exception as e:
-                print(f"UV texture failed: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print("Skipping UV texture (enable_texture=False, saves ~60-90s)")
-
-        return {
-            "success": True,
-            "measurements": measurements,
-            "vertices": hull_mesh.vertices.tolist(),
-            "faces": hull_mesh.faces.tolist(),
-            "keypoints_3d": kp_snapped,
-            "slices": slices_3d,
-            "uvs": uvs,
-            "texture_b64": texture_b64,
-            "viz_source": "video_visual_hull",
-        }
+        print(f"Delegating to _do_analyze with {len(photos)} cardinal views: {list(photos.keys())}")
+        result = self._do_analyze(photos, height_cm)
+        if isinstance(result, dict) and "viz_source" in result:
+            result["viz_source"] = "video_pifuhd"
+        return result
 
     def _build_hull_from_rotation(self, silhouettes_with_angle, height_cm,
                                     voxel_size_mm=5):

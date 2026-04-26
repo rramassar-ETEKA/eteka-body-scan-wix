@@ -41,6 +41,10 @@ export default function Home() {
   const [uploadPct, setUploadPct] = useState(0);
   const [extractPct, setExtractPct] = useState(0);
   const [pollSec, setPollSec] = useState(0);
+  const [pollCount, setPollCount] = useState(0);
+  const [pollStatus, setPollStatus] = useState<string>("-");
+  const [pollJobId, setPollJobId] = useState<string>("");
+  const [pollModalUrl, setPollModalUrl] = useState<string>("");
   const [analyzePhase, setAnalyzePhase] = useState<"extract" | "upload" | "processing">("upload");
   const mainRef = useRef<HTMLDivElement>(null);
 
@@ -178,47 +182,67 @@ export default function Home() {
     });
   };
 
+  const pollOnce = async (modalUrl: string, jobId: string): Promise<{ status: string; result?: AnalysisResult; detail?: string }> => {
+    const resp = await fetch(`${modalUrl}/job/${jobId}`, { cache: "no-store" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.json();
+  };
+
   const pollJob = async (
     modalUrl: string,
     jobId: string,
     onElapsed?: (sec: number) => void,
   ): Promise<AnalysisResult> => {
     const POLL_INTERVAL_MS = 3000;
-    const MAX_POLL_MS = 12 * 60 * 1000;
+    const MAX_POLL_MS = 15 * 60 * 1000;
     const t0 = Date.now();
-    let pollCount = 0;
+    let count = 0;
+    setPollCount(0);
+    setPollStatus("starting");
     while (true) {
       const elapsedMs = Date.now() - t0;
       if (elapsedMs > MAX_POLL_MS) {
-        throw new Error("Timeout (>12 min) - le serveur met trop longtemps");
+        throw new Error("Timeout (>15 min) - le serveur met trop longtemps");
       }
       onElapsed?.(Math.round(elapsedMs / 1000));
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      pollCount++;
+      count++;
+      setPollCount(count);
       try {
-        const resp = await fetch(`${modalUrl}/job/${jobId}`, { cache: "no-store" });
-        if (!resp.ok) {
-          console.warn(`[Body Scan] Poll ${pollCount} HTTP ${resp.status}, retrying`);
-          continue;
-        }
-        const pd = await resp.json();
+        const pd = await pollOnce(modalUrl, jobId);
         const elapsedSec = Math.round((Date.now() - t0) / 1000);
-        console.log(`[Body Scan] Poll ${pollCount} @ ${elapsedSec}s -> ${pd.status}`);
-        if (pd.status === "done" && pd.result) {
-          return pd.result;
-        }
-        if (pd.status === "error") {
-          throw new Error(pd.detail || "Erreur backend");
-        }
-        if (pd.status === "expired") {
-          throw new Error("Resultat expire");
-        }
+        console.log(`[Body Scan] Poll ${count} @ ${elapsedSec}s -> ${pd.status}`);
+        setPollStatus(pd.status);
+        if (pd.status === "done" && pd.result) return pd.result;
+        if (pd.status === "error") throw new Error(pd.detail || "Erreur backend");
+        if (pd.status === "expired") throw new Error("Resultat expire");
       } catch (e) {
         if (e instanceof Error && (e.message.startsWith("Erreur backend") || e.message.startsWith("Resultat expire") || e.message.startsWith("Timeout"))) {
           throw e;
         }
-        console.warn(`[Body Scan] Poll ${pollCount} network error (will retry):`, e);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn(`[Body Scan] Poll ${count} fail (will retry):`, msg);
+        setPollStatus(`error retry: ${msg.slice(0, 40)}`);
       }
+    }
+  };
+
+  const manualCheck = async () => {
+    if (!pollJobId || !pollModalUrl) return;
+    setPollStatus("checking...");
+    try {
+      const pd = await pollOnce(pollModalUrl, pollJobId);
+      setPollStatus(pd.status);
+      if (pd.status === "done" && pd.result) {
+        setResult(pd.result);
+        setStatus("done");
+        try { sessionStorage.removeItem("eteka_pending_job"); } catch {}
+      } else if (pd.status === "error") {
+        setError(pd.detail || "Erreur backend");
+        setStatus("error");
+      }
+    } catch (e) {
+      setPollStatus(`erreur: ${e instanceof Error ? e.message : "reseau"}`);
     }
   };
 
@@ -239,6 +263,8 @@ export default function Home() {
     setStatus("analyzing");
     setMode("premium");
     setAnalyzePhase("processing");
+    setPollJobId(pending.jobId);
+    setPollModalUrl(pending.modalUrl);
     pollJob(pending.modalUrl, pending.jobId, setPollSec)
       .then((d: AnalysisResult) => {
         setResult(d);
@@ -359,6 +385,8 @@ export default function Home() {
           throw new Error("Reponse submit invalide (job_id manquant)");
         }
         const jobId: string = submit.job_id;
+        setPollJobId(jobId);
+        setPollModalUrl(MODAL_URL);
         try {
           sessionStorage.setItem("eteka_pending_job", JSON.stringify({ jobId, modalUrl: MODAL_URL, ts: Date.now() }));
         } catch {}
@@ -621,13 +649,37 @@ export default function Home() {
                 <p className="text-sm text-[var(--foreground)]/60">
                   Reconstruction 3D multi-vue en cours...
                 </p>
-                {mode === "premium" && pollSec > 0 && (
-                  <p className="text-sm text-[var(--accent)] font-mono">
-                    {Math.floor(pollSec / 60)}min {pollSec % 60}s
-                  </p>
+                {mode === "premium" && (
+                  <div className="bg-[var(--surface)] rounded-xl p-3 mt-2 text-left text-xs space-y-1 font-mono">
+                    <div className="flex justify-between">
+                      <span className="text-[var(--foreground)]/60">Temps</span>
+                      <span className="text-[var(--accent)]">
+                        {Math.floor(pollSec / 60)}min {pollSec % 60}s
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-[var(--foreground)]/60">Polls</span>
+                      <span>{pollCount}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-[var(--foreground)]/60">Statut</span>
+                      <span className="truncate max-w-[60%]">{pollStatus}</span>
+                    </div>
+                    {pollJobId && (
+                      <div className="text-[var(--foreground)]/40 truncate">{pollJobId}</div>
+                    )}
+                  </div>
+                )}
+                {mode === "premium" && pollJobId && (
+                  <button
+                    onClick={manualCheck}
+                    className="w-full mt-2 py-2 rounded-lg bg-[var(--accent)] text-black text-sm font-medium hover:opacity-90 active:scale-[0.98] transition-all"
+                  >
+                    Vérifier maintenant
+                  </button>
                 )}
                 <p className="text-xs text-[var(--foreground)]/40">
-                  {mode === "premium" ? "1-3 min. Garde l'onglet ouvert et au premier plan." : "Cela peut prendre 30-60 secondes"}
+                  {mode === "premium" ? "1-3 min. Garde l'onglet ouvert au premier plan." : "Cela peut prendre 30-60 secondes"}
                 </p>
               </>
             )}

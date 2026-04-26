@@ -1661,7 +1661,28 @@ class BodyScanner:
 
         print(f"Delegating to _do_analyze with {len(photos)} cardinal views: {list(photos.keys())}")
         result = self._do_analyze(photos, height_cm)
-        if isinstance(result, dict) and "viz_source" in result:
+        if not isinstance(result, dict) or "vertices" not in result:
+            return result
+
+        # Override texture: use ALL N video frames (typically 16) instead of just
+        # the 4 cardinals. _apply_uv_texture_multiview produces an NxM atlas with
+        # per-vertex view selection, which gives less stretching and better
+        # coverage than the 2x2 stretched atlas used by _do_analyze.
+        try:
+            import trimesh, numpy as np
+            verts = np.asarray(result["vertices"], dtype=np.float32)
+            faces = np.asarray(result["faces"], dtype=np.uint32)
+            mesh_for_tex = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            tex_frames = [(a, j) for a, j, _ in frames]  # drop hip_px_x
+            print(f"Re-applying texture with {len(tex_frames)} video frames...")
+            uvs, texture_b64 = self._apply_uv_texture_multiview(mesh_for_tex, tex_frames)
+            result["uvs"] = uvs
+            result["texture_b64"] = texture_b64
+            result["viz_source"] = "video_pifuhd_multiview_tex"
+        except Exception as e:
+            print(f"Multi-view texture override failed (keeping _do_analyze 4-view texture): {e}")
+            import traceback
+            traceback.print_exc()
             result["viz_source"] = "video_pifuhd"
         return result
 
